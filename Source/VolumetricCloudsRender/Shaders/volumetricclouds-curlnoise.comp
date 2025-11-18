@@ -1,0 +1,27 @@
+// This shader expects volumetricclouds-utils.glsl to be concatenated before it at load time
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D CurlOut;
+
+uniform ivec2 TextureSize;
+
+void main()
+{
+    ivec2 tid = ivec2(gl_GlobalInvocationID.xy);
+    if (tid.x >= TextureSize.x || tid.y >= TextureSize.y)
+        return;
+
+    vec2 pos = (vec2(tid) + 0.5) / vec2(TextureSize);
+
+    const float totalCurlSize = 4.0;
+    const float curlNoiseRemapLow = -0.5;
+    const float curlNoiseRemapHigh = 3.0;
+
+    vec3 noise = CurlNoise(vec3(pos * totalCurlSize, 0.0));
+    noise = Remap01Unsaturated(noise, curlNoiseRemapLow, curlNoiseRemapHigh);
+    noise = EncodeCurlNoise(noise);
+
+    imageStore(CurlOut, tid, vec4(noise, 1.0));
+}
+

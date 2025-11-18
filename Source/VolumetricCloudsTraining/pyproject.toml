@@ -1,0 +1,33 @@
+[project]
+name = "Artificial-Intelligence-in-Games-and-Simulation"
+version = "0.1.0"
+description = "Volumetric clouds supervised learning"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy>=1.26.0",
+    # Torch (CUDA wheels resolved via [tool.uv.sources] below)
+    "torch",
+    "matplotlib>=3.8.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["VolumetricCloudsTraining*"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.ruff]
+line-length = 120
+
+# --------------------------------------------------------------------
+# uv configuration: fetch Torch family from CUDA 12.8 index
+# --------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]

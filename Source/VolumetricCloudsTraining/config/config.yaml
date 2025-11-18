@@ -1,0 +1,54 @@
+# ================================================================
+# Volumetric Clouds Training Configuration
+# ================================================================
+
+# Paths are resolved relative to the project root (next to this config/ folder).
+train:
+  data_dir: TrainingCaptures
+  output_dir: Outputs
+
+  # Training schedule ---------------------------------------------------------
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+  crop_size: 256
+  limit_pairs: null  # use all available pairs
+
+  # Model configuration -------------------------------------------------------
+  model_base_channels: 64
+  model_bilinear: true
+  model_learn_residual: true
+
+  # Runtime behaviour ---------------------------------------------------------
+  num_workers: 0
+  device: cuda
+  save_every_n_steps: 8192
+  log_every_n_steps: 256
+
+infer:
+  # Model checkpoint to use for inference
+  checkpoint: Outputs/checkpoints/unet_epoch_100.pt
+
+  # Model configuration ---------------------------------------------------------
+  # These must match the architecture used during training for the checkpoint
+  model_base_channels: 64
+  model_bilinear: true
+  model_learn_residual: true
+
+  # Input can be a single file or a directory. If a directory, input_glob applies.
+  input: TrainingCaptures
+  input_glob: "*_low.pfm"
+  recursive: false
+
+  # Output directory (files will be named <input_basename>_pred.pfm)
+  output_dir: Outputs/infer
+  output_suffix: "_pred"
+
+  # Runtime behaviour -----------------------------------------------------------
+  device: cuda
+  upsample_mode: bicubic
+  align_corners: false
+  clamp_min: 0.0
+  clamp_max: 1.0
+  scale_factor: 4
+

@@ -1,0 +1,555 @@
+
+// This shader expects volumetricclouds-uniforms.glsl and volumetricclouds-utils.glsl to be concatenated before it at load time
+
+// -------------------------------------------------------------------------
+//    Compute shader setup
+// -------------------------------------------------------------------------
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+// -------------------------------------------------------------------------
+//    Uniforms
+// -------------------------------------------------------------------------
+
+uniform vec2 FrameDimensions;
+uniform sampler3D ShapeNoiseTexture;
+uniform sampler3D DetailNoiseTexture;
+uniform sampler2D CurlNoiseTexture;
+uniform sampler2D WeatherMapTexture;
+uniform mat4 InvViewProjection;
+uniform vec3 CameraPosition;
+
+// -------------------------------------------------------------------------
+//    Helpers
+// -------------------------------------------------------------------------
+
+vec2 RaySphereIntersect(vec3 rayOrigin, vec3 rayDirection, vec3 sphereCenter, float sphereRadius)
+{
+    vec3 s0_r0 = rayOrigin - sphereCenter;
+    float b = dot(rayDirection, s0_r0);
+    float c = dot(s0_r0, s0_r0) - (sphereRadius * sphereRadius);
+    float discriminant = b * b - c;
+
+    if (discriminant < 0.0)
+        return vec2(-1.0);
+
+    float sqrtDisc = sqrt(discriminant);
+    return vec2(-b - sqrtDisc, -b + sqrtDisc);
+}
+
+float ComputeHeightFraction(vec3 position)
+{
+    float planetRadiusM = uEarthRadius * SKY_UNIT_TO_M;
+    vec3 planetCenterWorldM = uEarthCenter * SKY_UNIT_TO_M;
+    float height = distance(position, planetCenterWorldM) - (planetRadiusM + uCloudStartHeight);
+    return height / uCloudThickness;
+}
+
+// -------------------------------------------------------------------------
+//    Lighting Helpers
+// -------------------------------------------------------------------------
+
+const float PI = 3.14159265359;
+const float INV_FOUR_PI = 0.07957747154594767;
+
+const int MS_COUNT = 2;
+const float CLOUD_DENSITY_THRESHOLD = 0.001;
+
+// Simple white-noise hash. This is used to jitter the starting position of
+// the raymarch per ray when uJitterEnabled is true.
+float WhiteNoise(vec3 seed)
+{
+    const vec3 HASH_COEFFS = vec3(12.9898, 78.233, 37.719);
+    float dotSeed = dot(seed, HASH_COEFFS);
+    return fract(sin(dotSeed) * 43758.5453);
+}
+
+struct ParticipatingMedia
+{
+    vec3 scatteringCoefficients[MS_COUNT];
+    vec3 extinctionCoefficients[MS_COUNT];
+    vec3 transmittanceToLight[MS_COUNT];
+};
+
+ParticipatingMedia SampleParticipatingMedia(vec3 baseAlbedo, vec3 baseExtinctionCoefficients, float baseMsScatteringFactor, float baseMsExtinctionFactor, vec3 initialTransmittanceToLight)
+{
+    vec3 scatteringCoefficients = baseAlbedo * baseExtinctionCoefficients;
+
+    ParticipatingMedia participatingMedia;
+    participatingMedia.scatteringCoefficients[0] = scatteringCoefficients;
+    participatingMedia.extinctionCoefficients[0] = baseExtinctionCoefficients;
+    participatingMedia.transmittanceToLight[0] = initialTransmittanceToLight;
+
+    float MsScatteringFactor = baseMsScatteringFactor;
+    float MsExtinctionFactor = baseMsExtinctionFactor;
+
+    for (int ms = 1; ms < MS_COUNT; ++ms)
+    {
+        participatingMedia.scatteringCoefficients[ms] = participatingMedia.scatteringCoefficients[ms - 1] * MsScatteringFactor;
+        participatingMedia.extinctionCoefficients[ms] = participatingMedia.extinctionCoefficients[ms - 1] * MsExtinctionFactor;
+        MsScatteringFactor *= MsScatteringFactor;
+        MsExtinctionFactor *= MsExtinctionFactor;
+        participatingMedia.transmittanceToLight[ms] = initialTransmittanceToLight;
+    }
+
+    return participatingMedia;
+}
+
+float UniformPhase()
+{
+    return INV_FOUR_PI;
+}
+
+float HenyeyGreenstein(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float denominator = pow(max(1.0 + g2 - 2.0 * g * cosTheta, 0.0001), 1.5);
+    return (1.0 - g2) * INV_FOUR_PI / denominator;
+}
+
+float DualLobPhase(float g1, float g2, float blend, float cosTheta)
+{
+    float primary = HenyeyGreenstein(cosTheta, g1);
+    float secondary = HenyeyGreenstein(cosTheta, g2);
+    return mix(secondary, primary, clamp(blend, 0.0, 1.0));
+}
+
+struct ParticipatingMediaPhase
+{
+    float phase[MS_COUNT];
+};
+
+ParticipatingMediaPhase SampleParticipatingMediaPhase(float basePhase, float baseMsPhaseFactor)
+{
+    ParticipatingMediaPhase participatingMediaPhase;
+    participatingMediaPhase.phase[0] = basePhase;
+
+    float uniformPhase = UniformPhase();
+    float MsPhaseFactor = baseMsPhaseFactor;
+
+    for (int ms = 1; ms < MS_COUNT; ++ms)
+    {
+        participatingMediaPhase.phase[ms] = mix(uniformPhase, participatingMediaPhase.phase[0], MsPhaseFactor);
+        MsPhaseFactor *= MsPhaseFactor;
+    }
+
+    return participatingMediaPhase;
+}
+
+void VolumetricShadow(inout ParticipatingMedia participatingMedia, vec3 worldPosition, vec3 sunDirection, CloudLayer cloudLayer, float lod)
+{
+    vec3 extinctionAccumulation[MS_COUNT];
+    for (int ms = 0; ms < MS_COUNT; ++ms)
+    {
+        extinctionAccumulation[ms] = vec3(0.0);
+    }
+
+    int sampleCount = int(uShadowSampleCount);
+    if (sampleCount <= 0)
+        return;
+
+    const float sampleSegmentT = 0.5;
+    float lodOffset = 0.5;
+
+    for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+    {
+        float t0 = float(sampleIndex) / float(sampleCount);
+        float t1 = float(sampleIndex + 1) / float(sampleCount);
+
+        t0 = t0 * t0;
+        t1 = t1 * t1;
+
+        float delta = t1 - t0;
+        float t = t0 + delta * sampleSegmentT;
+
+        float shadowSampleT = uShadowStepLength * t;
+        vec3 samplePoint = worldPosition + sunDirection * shadowSampleT;
+
+        float heightFraction = GetHeightFractionForPoint(samplePoint);
+        if (heightFraction < 0.0 || heightFraction > 1.0)
+        {
+            break;
+        }
+
+        vec3 weatherData = SampleWeather(WeatherMapTexture, samplePoint, heightFraction, cloudLayer);
+        if (!ValidCloudDensity(heightFraction, weatherData))
+        {
+            continue;
+        }
+
+        float shadowCloudDensity = SampleCloudDensity(ShapeNoiseTexture, DetailNoiseTexture, CurlNoiseTexture, samplePoint, heightFraction, cloudLayer, weatherData, lod + lodOffset, true);
+        if (shadowCloudDensity <= 0.0)
+        {
+            continue;
+        }
+
+        vec3 shadowExtinction = SampleExtinction(shadowCloudDensity);
+        ParticipatingMedia shadowParticipatingMedia = SampleParticipatingMedia(vec3(0.0), shadowExtinction, uMultiScatteringScattering, uMultiScatteringExtinction, vec3(1.0));
+
+        for (int ms = 0; ms < MS_COUNT; ++ms)
+        {
+            extinctionAccumulation[ms] += shadowParticipatingMedia.extinctionCoefficients[ms] * delta;
+        }
+
+        lodOffset += 0.5;
+    }
+
+    for (int ms = 0; ms < MS_COUNT; ++ms)
+    {
+        participatingMedia.transmittanceToLight[ms] *= exp(-extinctionAccumulation[ms] * uShadowStepLength);
+    }
+}
+
+void VolumetricGroundContribution(inout vec3 environmentLuminance, vec3 worldPosition, vec3 sunDirection, vec3 sunIlluminance, CloudLayer cloudLayer, float lod)
+{
+    float planetRadius = uEarthRadius * SKY_UNIT_TO_M;
+    vec3 planetCenterWorld = uEarthCenter * SKY_UNIT_TO_M;
+    float cloudBottomRadius = planetRadius + uCloudStartHeight;
+    float cloudSampleAltitude = length(worldPosition - planetCenterWorld);
+    float cloudSampleHeightToBottom = max(cloudSampleAltitude - cloudBottomRadius, 0.0);
+
+    vec3 opticalDepth = vec3(0.0);
+
+    float contributionStepLength = min(4000.0, cloudSampleHeightToBottom);
+    if (contributionStepLength <= 0.0)
+    {
+        return;
+    }
+
+    vec3 groundScatterDirection = vec3(0.0, -1.0, 0.0);
+
+    int sampleCount = int(uGroundContributionSampleCount);
+    if (sampleCount <= 0)
+    {
+        return;
+    }
+
+    const float sampleSegmentT = 0.5;
+    float lodOffset = 0.5;
+
+    for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+    {
+        float t0 = float(sampleIndex) / float(sampleCount);
+        float t1 = float(sampleIndex + 1) / float(sampleCount);
+
+        t0 = t0 * t0;
+        t1 = t1 * t1;
+
+        float delta = t1 - t0;
+        float t = t0 + (t1 - t0) * sampleSegmentT;
+
+        float contributionSampleT = contributionStepLength * t;
+        vec3 samplePoint = worldPosition + groundScatterDirection * contributionSampleT;
+
+        float heightFraction = GetHeightFractionForPoint(samplePoint);
+
+        vec3 weatherData = SampleWeather(WeatherMapTexture, samplePoint, heightFraction, cloudLayer);
+        if (!ValidCloudDensity(heightFraction, weatherData))
+        {
+            continue;
+        }
+
+        float contributionCloudDensity = SampleCloudDensity(ShapeNoiseTexture, DetailNoiseTexture, CurlNoiseTexture, samplePoint, heightFraction, cloudLayer, weatherData, lod + lodOffset, true);
+        if (contributionCloudDensity <= 0.0)
+        {
+            continue;
+        }
+
+        vec3 contributionExtinction = SampleExtinction(contributionCloudDensity);
+        opticalDepth += contributionExtinction * contributionStepLength * delta;
+
+        lodOffset += 0.5;
+    }
+
+    vec3 planetSurfaceNormal = vec3(0.0, 1.0, 0.0);
+    vec3 groundAlbedo = uEarthGroundAlbedo;
+    float groundNdotL = clamp(dot(sunDirection, planetSurfaceNormal), 0.0, 1.0);
+    vec3 groundBrdfNdotL = groundNdotL * (groundAlbedo / PI);
+
+    float uniformPhase = UniformPhase();
+    float groundHemisphereLuminanceIsotropic = (2.0 * PI) * uniformPhase;
+    vec3 groundToCloudTransferIsoScatter = groundBrdfNdotL * groundHemisphereLuminanceIsotropic;
+
+    vec3 scatteredLuminance = sunIlluminance * groundToCloudTransferIsoScatter;
+    environmentLuminance += scatteredLuminance * exp(-opticalDepth);
+}
+
+vec3 SampleAmbientLight(float heightFraction)
+{
+    float isotropicScatteringTopContribution = clamp(uAmbientGroundMultiplier + heightFraction, 0.0, 1.0);
+    return isotropicScatteringTopContribution * uAmbientLuminance;
+}
+
+float CalculateAtmosphereBlend(float tDepth)
+{
+    float fogDistance = clamp(tDepth * uHorizonBlendAmount, 0.0, 1.0);
+
+    float fade = pow(fogDistance, uHorizonBlendPower);
+    fade = smoothstep(0.0, 1.0, fade);
+
+    const float maxHorizonFade = 0.0;
+    fade = clamp(fade, maxHorizonFade, 1.0);
+
+    return fade;
+}
+
+void VolumetricCloudLighting(vec3 startPosition,
+                             vec3 worldPosition,
+                             vec3 sunDirection,
+                             vec3 sunIlluminance,
+                             float cosTheta,
+                             float stepSize,
+                             float heightFraction,
+                             float cloudDensity,
+                             vec3 weatherData,
+                             CloudLayer cloudLayer,
+                             float lod,
+                             inout vec3 luminance,
+                             inout vec3 transmittanceToView,
+                             inout float depthWeightedSum,
+                             inout float depthWeightsSum)
+{
+    vec3 albedo = SampleAlbedo(cloudDensity, weatherData);
+    vec3 extinction = SampleExtinction(cloudDensity);
+
+    ParticipatingMedia participatingMedia = SampleParticipatingMedia(albedo, extinction, uMultiScatteringScattering, uMultiScatteringExtinction, vec3(1.0));
+
+    vec3 environmentLuminance = SampleAmbientLight(heightFraction);
+
+    if (any(greaterThan(participatingMedia.scatteringCoefficients[0], vec3(0.0))))
+    {
+        VolumetricShadow(participatingMedia, worldPosition, sunDirection, cloudLayer, lod);
+
+        float maxTransmittanceToView = max(transmittanceToView.r, max(transmittanceToView.g, transmittanceToView.b));
+        if (maxTransmittanceToView > 0.01)
+        {
+            VolumetricGroundContribution(environmentLuminance, worldPosition, sunDirection, sunIlluminance, cloudLayer, lod);
+        }
+    }
+
+    float phaseFunction = DualLobPhase(uPhaseG, uPhaseG2, uPhaseBlend, -cosTheta);
+    ParticipatingMediaPhase participatingMediaPhase = SampleParticipatingMediaPhase(phaseFunction, uMultiScatteringEccentricity);
+
+    float depthWeight = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
+    depthWeightedSum += depthWeight * length(worldPosition - startPosition);
+    depthWeightsSum += depthWeight;
+
+    for (int ms = MS_COUNT - 1; ms >= 0; --ms)
+    {
+        vec3 scatteringCoefficients = participatingMedia.scatteringCoefficients[ms];
+        vec3 extinctionCoefficients = participatingMedia.extinctionCoefficients[ms];
+        vec3 transmittanceToLight = participatingMedia.transmittanceToLight[ms];
+
+        vec3 lightLuminance = transmittanceToLight * sunIlluminance * participatingMediaPhase.phase[ms];
+        if (ms == 0)
+        {
+            lightLuminance += environmentLuminance;
+        }
+
+        vec3 scatteredLuminance = lightLuminance * scatteringCoefficients;
+
+        vec3 clampedExtinctionCoefficients = max(extinctionCoefficients, vec3(0.0000001));
+        vec3 sampleTransmittance = exp(-clampedExtinctionCoefficients * stepSize);
+        vec3 luminanceIntegral = (scatteredLuminance - scatteredLuminance * sampleTransmittance) / clampedExtinctionCoefficients;
+
+        luminance += transmittanceToView * luminanceIntegral;
+
+        if (ms == 0)
+        {
+            transmittanceToView *= sampleTransmittance;
+        }
+    }
+}
+
+vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
+{
+    vec3 planetCenterWorldM = uEarthCenter * SKY_UNIT_TO_M;
+    float planetRadiusM = uEarthRadius * SKY_UNIT_TO_M;
+    float cloudTopRadius = planetRadiusM + uCloudStartHeight + uCloudThickness;
+
+    vec2 topSolutions = RaySphereIntersect(rayOrigin, rayDirection, planetCenterWorldM, cloudTopRadius);
+    if (topSolutions.x < 0.0 && topSolutions.y < 0.0)
+        return vec4(0.0);
+
+    float tEnter = min(topSolutions.x, topSolutions.y);
+    float tExit = max(topSolutions.x, topSolutions.y);
+
+    if (tExit <= 0.0)
+        return vec4(0.0);
+
+    tEnter = max(tEnter, 0.0);
+
+    float marchLength = min(tExit - tEnter, uMaxMarchingDistance);
+    if (marchLength <= 0.0)
+        return vec4(0.0);
+
+    float steps = float(uMaxStepCount);
+    steps = max(steps, 1.0);
+    float stepSize = marchLength / steps;
+
+    CloudLayer cloudLayer = SampleCloudLayer();
+
+    vec3 accumulatedLuminance = vec3(0.0);
+    vec3 transmittanceToView = vec3(1.0);
+    float depthWeightedSum = 0.0;
+    float depthWeightsSum = 0.0;
+
+    float transmittanceThreshold = uTransmittanceThreshold;
+    float sunDirectionLength = length(uSunDirection);
+    vec3 sunDirection = (sunDirectionLength > 0.0) ? (uSunDirection / sunDirectionLength) : vec3(0.0, 1.0, 0.0);
+    vec3 sunIlluminance = uSunIlluminance;
+
+    float marchT = tEnter + 0.5 * stepSize;
+
+    // Use world-space origin, direction, and time to decorrelate noise
+    // spatially and temporally. Jitter is in [-0.5, 0.5], keeping the
+    // first sample within the first step interval.
+    if (uJitterEnabled)
+    {
+        vec3 jitterSeed = rayOrigin * 0.0001 + rayDirection * 37.0 + vec3(uTime);
+        float jitter = WhiteNoise(jitterSeed) - 0.5;
+        marchT = tEnter + (0.5 + jitter) * stepSize;
+    }
+
+    for (int stepIndex = 0; stepIndex < int(steps); ++stepIndex)
+    {
+        vec3 samplePosition = rayOrigin + rayDirection * marchT;
+
+        float heightFractionRaw = ComputeHeightFraction(samplePosition);
+        if (heightFractionRaw < 0.0)
+        {
+            marchT += stepSize;
+            continue;
+        }
+        if (heightFractionRaw > 1.0)
+        {
+            marchT += stepSize;
+            continue;
+        }
+
+        float heightFraction = clamp(heightFractionRaw, 0.0, 1.0);
+
+        vec3 weatherData = SampleWeather(WeatherMapTexture, samplePosition, heightFraction, cloudLayer);
+
+        float distanceAlongRay = marchT;
+        float lod = clamp(distanceAlongRay / max(uLODDistance, 0.0001), uLODMin, 3.0);
+
+        float density = SampleCloudDensity(ShapeNoiseTexture, DetailNoiseTexture, CurlNoiseTexture, samplePosition, heightFraction, cloudLayer, weatherData, lod, true);
+        if (density < CLOUD_DENSITY_THRESHOLD)
+        {
+            marchT += stepSize;
+            continue;
+        }
+
+        float cosTheta = dot(rayDirection, sunDirection);
+
+        VolumetricCloudLighting(rayOrigin,
+                                samplePosition,
+                                sunDirection,
+                                sunIlluminance,
+                                cosTheta,
+                                stepSize,
+                                heightFraction,
+                                density,
+                                weatherData,
+                                cloudLayer,
+                                lod,
+                                accumulatedLuminance,
+                                transmittanceToView,
+                                depthWeightedSum,
+                                depthWeightsSum);
+
+        float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
+        if (minTransmittance <= transmittanceThreshold)
+            break;
+
+        marchT += stepSize;
+    }
+
+    vec3 finalLuminance = max(accumulatedLuminance, vec3(0.0));
+    float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
+    float alpha = clamp(1.0 - minTransmittance, 0.0, 1.0);
+
+    if (depthWeightsSum > 0.0)
+    {
+        float tDepth = depthWeightedSum / depthWeightsSum;
+        float atmosphereBlend = CalculateAtmosphereBlend(tDepth);
+        float fadeFactor = 1.0 - atmosphereBlend;
+
+        float originalAlpha = alpha;
+        alpha *= fadeFactor;
+
+        if (originalAlpha > 0.0)
+        {
+            float premultCorrection = alpha / originalAlpha;
+            finalLuminance *= premultCorrection;
+        }
+        else
+        {
+            finalLuminance *= fadeFactor;
+        }
+    }
+
+    return vec4(finalLuminance, alpha);
+}
+
+vec4 RenderClouds(vec3 rayOrigin, vec3 rayDirection)
+{
+    vec4 clouds = RaymarchCloudLayer(rayOrigin, rayDirection);
+
+    // Simple premultiplied alpha to blend with background
+    clouds.rgb = clamp(clouds.rgb, 0.0, 1.0);
+    clouds.a = clamp(clouds.a, 0.0, 1.0);
+    return clouds;
+}
+
+// -------------------------------------------------------------------------
+//    Main
+// -------------------------------------------------------------------------
+
+void main()
+{
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (texelCoord.x >= int(FrameDimensions.x) || texelCoord.y >= int(FrameDimensions.y))
+        return;
+
+    vec2 uv = (vec2(texelCoord) + 0.5) / FrameDimensions;
+
+    // Debug switch: 0 = shape, 1 = detail, 2 = curl, 3 = weather, 4 = full clouds
+    const int DebugOutput = 4;
+    vec4 result = vec4(0.0);
+    if (DebugOutput == 0)
+    {
+        result = texture(ShapeNoiseTexture, vec3(uv, 0.0));
+    }
+    else if (DebugOutput == 1)
+    {
+        result = texture(DetailNoiseTexture, vec3(uv, 0.0));
+    }
+    else if (DebugOutput == 2)
+    {
+        result = texture(CurlNoiseTexture, uv);
+    }
+    else if (DebugOutput == 3)
+    {
+        result = texture(WeatherMapTexture, uv);
+    }
+    else
+    {
+        vec2 clipSpace = vec2(uv * 2.0 - 1.0);
+
+        vec4 worldNear = InvViewProjection * vec4(clipSpace, 0.0, 1.0);
+        vec4 worldFar = InvViewProjection * vec4(clipSpace, 1.0, 1.0);
+        worldNear /= worldNear.w;
+        worldFar /= worldFar.w;
+
+        vec3 rayOrigin = CameraPosition;
+        vec3 rayDirection = normalize(worldFar.xyz - rayOrigin);
+
+        result = RenderClouds(rayOrigin, rayDirection);
+    }
+
+    imageStore(outputImage, texelCoord, result);
+}

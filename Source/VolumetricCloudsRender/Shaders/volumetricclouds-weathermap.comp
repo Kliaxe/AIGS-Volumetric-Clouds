@@ -1,0 +1,62 @@
+// This shader expects volumetricclouds-utils.glsl to be concatenated before it at load time
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D WeatherOut;
+
+uniform ivec2 TextureSize;
+
+void main()
+{
+    ivec2 tid = ivec2(gl_GlobalInvocationID.xy);
+    if (tid.x >= TextureSize.x || tid.y >= TextureSize.y)
+        return;
+
+    vec2 pos = (vec2(tid) + 0.5) / vec2(TextureSize);
+
+    const float depthOffset1 = 0.0;
+    const float depthOffset2 = 500.0;
+    const float depthOffset3 = 100.0;
+    const float depthOffset4 = 200.0;
+
+    const float totalSize = 3.0;
+    const float worleySeed = 1.0;
+
+    const float perlinNoise1LowRemap = 1.0;
+    const float perlinNoise1HighRemap = 1.25;
+    const float worleyNoise1LowRemap = 0.65;
+    const float worleyNoise1HighRemap = 0.9;
+    const float perlinNoise2LowRemap = 0.85;
+    const float perlinNoise2HighRemap = 1.9;
+    const float perlinNoise3LowRemap = 0.5;
+    const float perlinNoise3HighRemap = 1.3;
+    const float perlinNoise4LowRemap = 1.0;
+    const float perlinNoise4HighRemap = 1.4;
+    const float coveragePerlinWorleyDifference = 1.0;
+
+    vec3 p1 = vec3(pos, depthOffset1);
+    vec3 p2 = vec3(pos, depthOffset2);
+    vec3 p3 = vec3(pos, depthOffset3);
+    vec3 p4 = vec3(pos, depthOffset4);
+
+    float perlinNoise1 = GetPerlin_7_Octaves(p1, 3.0 * totalSize, true);
+    float worleyNoise1 = GetWorley_2_Octaves(p1, 3.0 * totalSize, worleySeed);
+    float perlinNoise2 = GetPerlin_7_Octaves(p2, 3.0 * totalSize, true);
+    float perlinNoise3 = GetPerlin_7_Octaves(p3, 2.0 * totalSize, true);
+    float perlinNoise4 = GetPerlin_7_Octaves(p4, 3.0 * totalSize, true);
+
+    perlinNoise1 = Remap01(perlinNoise1, perlinNoise1LowRemap, perlinNoise1HighRemap);
+    worleyNoise1 = Remap01(worleyNoise1, worleyNoise1LowRemap, worleyNoise1HighRemap);
+    perlinNoise2 = Remap01(perlinNoise2, perlinNoise2LowRemap, perlinNoise2HighRemap);
+    perlinNoise3 = Remap01(perlinNoise3, perlinNoise3LowRemap, perlinNoise3HighRemap);
+    perlinNoise4 = Remap01(perlinNoise4, perlinNoise4LowRemap, perlinNoise4HighRemap);
+
+    float coverage = DilatePerlinWorley(perlinNoise1, worleyNoise1, coveragePerlinWorleyDifference);
+    coverage = clamp(coverage - perlinNoise4, 0.0, 1.0);
+
+    float type = perlinNoise2;
+    float rain = perlinNoise3;
+
+    imageStore(WeatherOut, tid, vec4(coverage, type, rain, 1.0));
+}
+

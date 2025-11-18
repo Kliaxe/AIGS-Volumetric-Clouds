@@ -1,0 +1,31 @@
+// This shader expects volumetricclouds-utils.glsl to be concatenated before it at load time
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(rgba32f, binding = 0) uniform image3D DetailOut;
+
+uniform ivec3 VolumeSize; // xyz size
+
+void main()
+{
+    ivec3 tid = ivec3(gl_GlobalInvocationID.xyz);
+    if (any(greaterThanEqual(tid, VolumeSize))) return;
+
+    vec3 pos = (vec3(tid) + 0.5) / vec3(VolumeSize);
+
+    const float detailNoiseLowRemap = -1.0;
+    const float detailNoiseHighRemap = 1.0;
+    const float totalSize = 0.5;
+
+    float worleyLarge = GetWorley_3_Octaves(pos, 10.0 * totalSize);
+    float worleyMedium = GetWorley_3_Octaves(pos, 15.0 * totalSize);
+    float worleySmall = GetWorley_3_Octaves(pos, 20.0 * totalSize);
+
+    worleyLarge = Remap01(worleyLarge, detailNoiseLowRemap, detailNoiseHighRemap);
+    worleyMedium = Remap01(worleyMedium, detailNoiseLowRemap, detailNoiseHighRemap);
+    worleySmall = Remap01(worleySmall, detailNoiseLowRemap, detailNoiseHighRemap);
+
+    vec4 noiseSample = vec4(worleyLarge, worleyMedium, worleySmall, 1.0);
+    imageStore(DetailOut, tid, noiseSample);
+}
+
