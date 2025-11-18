@@ -25,14 +25,30 @@ class CloudPairDatasetConfig:
     align_corners: bool = False
     limit_pairs: Optional[int] = None  # For quick sanity checks
 
+    # Optional auxiliary data channels extracted from *_low_data.pfm / *_high_data.pfm
+    # These are concatenated to the low-resolution RGB input before upsampling.
+    use_view_transmittance: bool = True
+    use_light_transmittance: bool = True
+    use_linear_depth: bool = True
+
+    # Depth normalization scale in world units. The raw linear depth stored in the PFM
+    # (blue channel of the data image) is divided by this value and clamped to [0, 1]
+    # before being fed to the network.
+    depth_normalization_max: float = 40000.0
+
 
 class CloudPairDataset(Dataset):
     """
     Pairs of low/high .pfm images:
-      - low  resolution: 320 x 180
-      - high resolution: 1280 x 720
-    Input to the model is the low image upsampled to high resolution (by factor 4).
-    The target is the high-resolution image.
+      - low  resolution colour:   pair_XXXXXX_low.pfm
+      - high resolution colour:   pair_XXXXXX_high.pfm
+      - optional low data image:  pair_XXXXXX_low_data.pfm
+      - optional high data image: pair_XXXXXX_high_data.pfm (currently unused)
+
+    Input to the model is the low image upsampled to high resolution (by factor 4),
+    optionally concatenated with upsampled auxiliary channels derived from the low
+    data image (view transmittance, light transmittance, linear depth).
+    The target is the high-resolution colour image.
     """
 
     def __init__(self, config: CloudPairDatasetConfig):
@@ -79,24 +95,93 @@ class CloudPairDataset(Dataset):
         if low_np.ndim == 2:
             low_np = np.repeat(low_np[..., None], 3, axis=2)
 
-        # Clamp values to a sane range
+        # Clamp colour values to a sane range
         high_np = np.clip(high_np, self._config.clamp_min, self._config.clamp_max)
         low_np = np.clip(low_np, self._config.clamp_min, self._config.clamp_max)
+
+        # Optional auxiliary data image at low resolution ------------------------------------------
+        # Expected layout in the renderer:
+        #   R: view transmittance to camera (T_view in [0, 1])
+        #   G: light-space transmittance / visibility (T_light in [0, 1])
+        #   B: linear depth to effective scattering point (t_depth in world units)
+        #   A: reserved
+        low_data_path = low_path.replace("_low.pfm", "_low_data.pfm")
+        low_data_np: Optional[np.ndarray]
+        if os.path.isfile(low_data_path):
+            low_data_np = read_pfm(low_data_path)
+        else:
+            low_data_np = None
+
+        # Build a physically reasonable default data image if none is present so that the channel
+        # layout remains consistent even for legacy captures.
+        if low_data_np is None:
+            h_low, w_low, _ = low_np.shape
+            # Default to fully transparent / unoccluded with zero depth.
+            # R=T_view=1, G=T_light=1, B=depth=0
+            low_data_np = np.zeros((h_low, w_low, 3), dtype=np.float32)
+            low_data_np[..., 0] = 1.0
+            low_data_np[..., 1] = 1.0
+        elif low_data_np.ndim == 2:
+            low_data_np = np.repeat(low_data_np[..., None], 3, axis=2)
+
+        # Ensure at least 3 channels; ignore any potential alpha channel beyond RGB.
+        if low_data_np.shape[2] < 3:
+            # Pad missing channels with reasonable defaults (T_view=1, T_light=1, depth=0)
+            pad = 3 - low_data_np.shape[2]
+            pad_values = np.zeros((low_data_np.shape[0], low_data_np.shape[1], pad), dtype=np.float32)
+            if pad >= 1:
+                pad_values[..., 0] = 1.0
+            if pad >= 2:
+                pad_values[..., 1] = 1.0
+            low_data_np = np.concatenate([low_data_np, pad_values], axis=2)
+
+        # Extract and normalise auxiliary channels
+        t_view_np = np.clip(low_data_np[..., 0:1], 0.0, 1.0)
+        t_light_np = np.clip(low_data_np[..., 1:2], 0.0, 1.0)
+        depth_np = low_data_np[..., 2:3]
+        depth_np = np.maximum(depth_np, 0.0)
+        if self._config.depth_normalization_max > 0.0:
+            depth_np = depth_np / float(self._config.depth_normalization_max)
+        depth_np = np.clip(depth_np, 0.0, 1.0)
 
         # To torch (C, H, W)
         # Convert HWC (NumPy) -> CHW (PyTorch). Channel-first is the standard for torch layers.
         # permute(2,0,1): move channels axis from last to first. contiguous(): ensure memory layout is contiguous.
         high = torch.from_numpy(high_np).permute(2, 0, 1).contiguous()  # [3, H, W]
         low = torch.from_numpy(low_np).permute(2, 0, 1).contiguous()    # [3, h, w]
+        t_view = torch.from_numpy(t_view_np).permute(2, 0, 1).contiguous()   # [1, h, w]
+        t_light = torch.from_numpy(t_light_np).permute(2, 0, 1).contiguous() # [1, h, w]
+        depth = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous()     # [1, h, w]
 
         # Upsample low to high resolution using chosen interpolation
         _, target_h, target_w = high.shape
-        low_up = F.interpolate(
+        low_up_rgb = F.interpolate(
             low.unsqueeze(0),
             size=(target_h, target_w),
             mode=self._config.upsample_mode,
             align_corners=self._config.align_corners if self._config.upsample_mode in ("bilinear", "bicubic") else None,
         ).squeeze(0)
+
+        # Upsample auxiliary channels and concatenate with RGB input
+        aux_channels: List[torch.Tensor] = []
+        if self._config.use_view_transmittance:
+            aux_channels.append(t_view)
+        if self._config.use_light_transmittance:
+            aux_channels.append(t_light)
+        if self._config.use_linear_depth:
+            aux_channels.append(depth)
+
+        if aux_channels:
+            aux_stack = torch.cat(aux_channels, dim=0)  # [C_aux, h, w]
+            aux_up = F.interpolate(
+                aux_stack.unsqueeze(0),
+                size=(target_h, target_w),
+                mode=self._config.upsample_mode,
+                align_corners=self._config.align_corners if self._config.upsample_mode in ("bilinear", "bicubic") else None,
+            ).squeeze(0)
+            low_up = torch.cat([low_up_rgb, aux_up], dim=0)
+        else:
+            low_up = low_up_rgb
 
         # Why cropping?
         # - Data augmentation: exposes the model to diverse local patterns, reducing overfitting.

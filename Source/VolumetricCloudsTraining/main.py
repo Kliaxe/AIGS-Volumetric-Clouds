@@ -104,6 +104,11 @@ def _build_train_config(config: dict, project_root: Path) -> TrainConfig:
         "model_base_channels": train_section.get("model_base_channels", field_defaults["model_base_channels"]),
         "model_bilinear": train_section.get("model_bilinear", field_defaults["model_bilinear"]),
         "model_learn_residual": train_section.get("model_learn_residual", field_defaults["model_learn_residual"]),
+        # Auxiliary feature usage ------------------------------------------------
+        "use_view_transmittance": train_section.get("use_view_transmittance", field_defaults["use_view_transmittance"]),
+        "use_light_transmittance": train_section.get("use_light_transmittance", field_defaults["use_light_transmittance"]),
+        "use_linear_depth": train_section.get("use_linear_depth", field_defaults["use_linear_depth"]),
+        "depth_normalization_max": train_section.get("depth_normalization_max", field_defaults["depth_normalization_max"]),
     }
 
     return TrainConfig(**kwargs)
@@ -135,6 +140,11 @@ def _build_infer_config(config: dict, project_root: Path) -> InferConfig:
         scale_factor=int(infer_section.get("scale_factor", 4)),
         recursive=bool(infer_section.get("recursive", False)),
         output_suffix=str(infer_section.get("output_suffix", "_pred")),
+        # Auxiliary feature usage (must match training)
+        use_view_transmittance=bool(infer_section.get("use_view_transmittance", True)),
+        use_light_transmittance=bool(infer_section.get("use_light_transmittance", True)),
+        use_linear_depth=bool(infer_section.get("use_linear_depth", True)),
+        depth_normalization_max=float(infer_section.get("depth_normalization_max", 40000.0)),
     )
 
 

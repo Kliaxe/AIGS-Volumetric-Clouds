@@ -57,14 +57,40 @@ bool TrainingFrameWriter::WritePair(std::uint32_t pairIndex,
         return false;
     }
 
-    const std::filesystem::path lowFramePath = BuildFramePath(pairIndex, "low", ".pfm");
-    const std::filesystem::path highFramePath = BuildFramePath(pairIndex, "high", ".pfm");
+    // ----------------------------------------------------------------------------------------------
+    // Build file paths for the colour and auxiliary data images at both resolutions.
+    // Existing naming for the colour images is preserved for backwards compatibility so that
+    // previously written consumers which expect only "low/high" PFM files continue to work.
+    // The auxiliary data images use explicit labels to make their intent clear.
+    // ----------------------------------------------------------------------------------------------
+    const std::filesystem::path lowColorPath  = BuildFramePath(pairIndex, "low", ".pfm");
+    const std::filesystem::path highColorPath = BuildFramePath(pairIndex, "high", ".pfm");
+    const std::filesystem::path lowDataPath   = BuildFramePath(pairIndex, "low_data", ".pfm");
+    const std::filesystem::path highDataPath  = BuildFramePath(pairIndex, "high_data", ".pfm");
     const std::filesystem::path metadataPath = BuildMetadataPath(pairIndex);
 
     bool success = true;
 
-    success &= WriteFrame(lowFramePath, lowResolutionFrame);
-    success &= WriteFrame(highFramePath, fullResolutionFrame);
+    // Colour images -------------------------------------------------------------------------------
+    success &= WriteFrame(lowColorPath, lowResolutionFrame);
+    success &= WriteFrame(highColorPath, fullResolutionFrame);
+
+    // Auxiliary data images -----------------------------------------------------------------------
+    // It is legal for the data buffers to be empty (for example, legacy captures produced before
+    // the data path was introduced). In that case we simply skip writing the data PFM files.
+    if (!lowResolutionFrame.rgbaDataPixels.empty())
+    {
+        success &= WriteFramePixels(lowDataPath,
+                                    lowResolutionFrame.resolution,
+                                    lowResolutionFrame.rgbaDataPixels);
+    }
+
+    if (!fullResolutionFrame.rgbaDataPixels.empty())
+    {
+        success &= WriteFramePixels(highDataPath,
+                                    fullResolutionFrame.resolution,
+                                    fullResolutionFrame.rgbaDataPixels);
+    }
     success &= WriteMetadata(metadataPath, pairIndex, metadata);
 
     return success;
@@ -73,7 +99,15 @@ bool TrainingFrameWriter::WritePair(std::uint32_t pairIndex,
 // --------------------------------------------------------------------------------------------------
 // Frame persistence (PFM format)
 // --------------------------------------------------------------------------------------------------
-bool TrainingFrameWriter::WriteFrame(const std::filesystem::path& filePath, const FrameCapture& frame) const
+bool TrainingFrameWriter::WriteFrame(const std::filesystem::path& filePath,
+                                    const FrameCapture& frame) const
+{
+    return WriteFramePixels(filePath, frame.resolution, frame.rgbaColorPixels);
+}
+
+bool TrainingFrameWriter::WriteFramePixels(const std::filesystem::path& filePath,
+                                           const glm::ivec2& resolution,
+                                           const std::vector<float>& pixels) const
 {
     std::ofstream fileStream(filePath, std::ios::binary);
 
@@ -85,22 +119,29 @@ bool TrainingFrameWriter::WriteFrame(const std::filesystem::path& filePath, cons
     }
 
     fileStream << "PF\n";
-    fileStream << frame.resolution.x << " " << frame.resolution.y << "\n";
+    fileStream << resolution.x << " " << resolution.y << "\n";
     fileStream << "-1.0\n";
 
     const std::size_t channelCount = 4U;
 
-    for (int y = 0; y < frame.resolution.y; ++y)
+    if (pixels.size() < static_cast<std::size_t>(resolution.x) * static_cast<std::size_t>(resolution.y) * channelCount)
     {
-        const std::size_t rowOffset = static_cast<std::size_t>(y) * frame.resolution.x * channelCount;
+        std::cerr << "[TrainingFrameWriter] Pixel buffer too small for frame: "
+                  << filePath << std::endl;
+        return false;
+    }
 
-        for (int x = 0; x < frame.resolution.x; ++x)
+    for (int y = 0; y < resolution.y; ++y)
+    {
+        const std::size_t rowOffset = static_cast<std::size_t>(y) * resolution.x * channelCount;
+
+        for (int x = 0; x < resolution.x; ++x)
         {
             const std::size_t pixelOffset = rowOffset + static_cast<std::size_t>(x) * channelCount;
 
-            const float r = frame.rgbaPixels[pixelOffset + 0U];
-            const float g = frame.rgbaPixels[pixelOffset + 1U];
-            const float b = frame.rgbaPixels[pixelOffset + 2U];
+            const float r = pixels[pixelOffset + 0U];
+            const float g = pixels[pixelOffset + 1U];
+            const float b = pixels[pixelOffset + 2U];
 
             fileStream.write(reinterpret_cast<const char*>(&r), sizeof(float));
             fileStream.write(reinterpret_cast<const char*>(&g), sizeof(float));

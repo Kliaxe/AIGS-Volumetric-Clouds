@@ -49,6 +49,14 @@ class InferConfig:
     recursive: bool = False           # recurse when input_path is directory
     output_suffix: str = "_pred"      # appended before extension
 
+    # Auxiliary input feature toggles (must match training) ---------------------
+    use_view_transmittance: bool = True
+    use_light_transmittance: bool = True
+    use_linear_depth: bool = True
+
+    # Normalisation scale for the linear depth channel (world units).
+    depth_normalization_max: float = 40000.0
+
 
 # ================================================================
 #                              HELPERS
@@ -100,8 +108,16 @@ def infer_unet(config: InferConfig) -> None:
     # ----------------- Model -----------------
     # Mirror the way the training script constructs UNet: derive a UNetConfig
     # from the model_* fields so that architecture exactly matches training.
+    in_channels = 3
+    if config.use_view_transmittance:
+        in_channels += 1
+    if config.use_light_transmittance:
+        in_channels += 1
+    if config.use_linear_depth:
+        in_channels += 1
+
     unet_config = UNetConfig(
-        in_channels=3,
+        in_channels=in_channels,
         out_channels=3,
         base_channels=config.model_base_channels,
         bilinear=config.model_bilinear,
@@ -121,30 +137,88 @@ def infer_unet(config: InferConfig) -> None:
     # ----------------- Run -----------------
     with torch.no_grad():
         for in_path in inputs:
-            # Load PFM (H, W[, 3]) -> ensure 3 channels
+            # Load low-resolution colour PFM (H, W[, 3]) -> ensure 3 channels
             np_img = read_pfm(in_path)
             if np_img.ndim == 2:
                 np_img = np.repeat(np_img[..., None], 3, axis=2)
 
-            # Clamp to expected range
+            # Clamp colour to expected range
             np_img = np.clip(np_img, config.clamp_min, config.clamp_max).astype(np.float32, copy=False)
             h, w, _ = np_img.shape
 
+            # Derive corresponding low-data path (optional)
+            base, ext = os.path.splitext(in_path)
+            if base.endswith("_low"):
+                data_path = f"{base}_data{ext}"
+            else:
+                data_path = base + "_data" + ext
+
+            np_data = read_pfm(data_path) if os.path.isfile(data_path) else None
+
+            if np_data is None:
+                # Build default data image: T_view=1, T_light=1, depth=0
+                np_data = np.zeros((h, w, 3), dtype=np.float32)
+                np_data[..., 0] = 1.0
+                np_data[..., 1] = 1.0
+            elif np_data.ndim == 2:
+                np_data = np.repeat(np_data[..., None], 3, axis=2)
+
+            if np_data.shape[2] < 3:
+                pad = 3 - np_data.shape[2]
+                pad_values = np.zeros((h, w, pad), dtype=np.float32)
+                if pad >= 1:
+                    pad_values[..., 0] = 1.0
+                if pad >= 2:
+                    pad_values[..., 1] = 1.0
+                np_data = np.concatenate([np_data, pad_values], axis=2)
+
+            # Extract and normalise auxiliary channels
+            t_view_np = np.clip(np_data[..., 0:1], 0.0, 1.0)
+            t_light_np = np.clip(np_data[..., 1:2], 0.0, 1.0)
+            depth_np = np_data[..., 2:3]
+            depth_np = np.maximum(depth_np, 0.0)
+            if config.depth_normalization_max > 0.0:
+                depth_np = depth_np / float(config.depth_normalization_max)
+            depth_np = np.clip(depth_np, 0.0, 1.0)
+
             # To torch, CHW
-            t_low = torch.from_numpy(np_img).permute(2, 0, 1).contiguous().unsqueeze(0).to(device)
+            t_low_rgb = torch.from_numpy(np_img).permute(2, 0, 1).contiguous().unsqueeze(0).to(device)
+            t_view = torch.from_numpy(t_view_np).permute(2, 0, 1).contiguous().unsqueeze(0).to(device)
+            t_light = torch.from_numpy(t_light_np).permute(2, 0, 1).contiguous().unsqueeze(0).to(device)
+            depth = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous().unsqueeze(0).to(device)
 
             # Upsample to target size (scale factor, e.g., 4x)
             target_h = int(h * config.scale_factor)
             target_w = int(w * config.scale_factor)
-            t_low_up = F.interpolate(
-                t_low,
+            t_low_up_rgb = F.interpolate(
+                t_low_rgb,
                 size=(target_h, target_w),
                 mode=config.upsample_mode,
                 align_corners=config.align_corners if config.upsample_mode in ("bilinear", "bicubic") else None,
             )
 
+            aux_tensors = []
+            if config.use_view_transmittance:
+                aux_tensors.append(t_view)
+            if config.use_light_transmittance:
+                aux_tensors.append(t_light)
+            if config.use_linear_depth:
+                aux_tensors.append(depth)
+
+            if aux_tensors:
+                aux_stack = torch.cat(aux_tensors, dim=1)  # [1, C_aux, h, w]
+                aux_up = F.interpolate(
+                    aux_stack,
+                    size=(target_h, target_w),
+                    mode=config.upsample_mode,
+                    align_corners=config.align_corners if config.upsample_mode in ("bilinear", "bicubic") else None,
+                )
+                t_input = torch.cat([t_low_up_rgb, aux_up], dim=1)
+            else:
+                t_input = t_low_up_rgb
+
             # Predict
-            pred = model(t_low_up)  # [1, 3, H', W']
+            pred = model(t_input)  # [1, 3, H', W']
             pred = torch.clamp(pred, 0.0, 1.0)
 
             # Save

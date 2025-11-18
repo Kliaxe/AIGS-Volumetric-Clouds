@@ -9,6 +9,14 @@ layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 
+// Auxiliary data output ---------------------------------------------------------------------------
+//  Stores per-pixel training features in an RGBA32F image:
+//      R: view-space transmittance to the camera (T_view)
+//      G: light-space transmittance / visibility (T_light) at the effective scattering region
+//      B: linear depth to effective scattering point (t_depth, in world units)
+//      A: reserved (currently 1.0)
+layout(rgba32f, binding = 1) uniform image2D dataOutputImage;
+
 // -------------------------------------------------------------------------
 //    Uniforms
 // -------------------------------------------------------------------------
@@ -309,7 +317,8 @@ void VolumetricCloudLighting(vec3 startPosition,
                              inout vec3 luminance,
                              inout vec3 transmittanceToView,
                              inout float depthWeightedSum,
-                             inout float depthWeightsSum)
+                             inout float depthWeightsSum,
+                             inout float lightVisibilityWeightedSum)
 {
     vec3 albedo = SampleAlbedo(cloudDensity, weatherData);
     vec3 extinction = SampleExtinction(cloudDensity);
@@ -346,6 +355,12 @@ void VolumetricCloudLighting(vec3 startPosition,
         if (ms == 0)
         {
             lightLuminance += environmentLuminance;
+
+            // Accumulate a view-weighted estimate of light visibility for training output. We use
+            // the same depth weight as the effective scattering depth so that the two statistics
+            // are coupled spatially.
+            float sampleLightVisibility = min(transmittanceToLight.r, min(transmittanceToLight.g, transmittanceToLight.b));
+            lightVisibilityWeightedSum += depthWeight * sampleLightVisibility;
         }
 
         vec3 scatteredLuminance = lightLuminance * scatteringCoefficients;
@@ -363,7 +378,11 @@ void VolumetricCloudLighting(vec3 startPosition,
     }
 }
 
-vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
+vec4 RaymarchCloudLayer(vec3 rayOrigin,
+                        vec3 rayDirection,
+                        out float outViewTransmittance,
+                        out float outLightTransmittance,
+                        out float outLinearDepth)
 {
     vec3 planetCenterWorldM = uEarthCenter * SKY_UNIT_TO_M;
     float planetRadiusM = uEarthRadius * SKY_UNIT_TO_M;
@@ -371,19 +390,34 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
 
     vec2 topSolutions = RaySphereIntersect(rayOrigin, rayDirection, planetCenterWorldM, cloudTopRadius);
     if (topSolutions.x < 0.0 && topSolutions.y < 0.0)
+    {
+        outViewTransmittance = 1.0;
+        outLightTransmittance = 1.0;
+        outLinearDepth = 0.0;
         return vec4(0.0);
+    }
 
     float tEnter = min(topSolutions.x, topSolutions.y);
     float tExit = max(topSolutions.x, topSolutions.y);
 
     if (tExit <= 0.0)
+    {
+        outViewTransmittance = 1.0;
+        outLightTransmittance = 1.0;
+        outLinearDepth = 0.0;
         return vec4(0.0);
+    }
 
     tEnter = max(tEnter, 0.0);
 
     float marchLength = min(tExit - tEnter, uMaxMarchingDistance);
     if (marchLength <= 0.0)
+    {
+        outViewTransmittance = 1.0;
+        outLightTransmittance = 1.0;
+        outLinearDepth = 0.0;
         return vec4(0.0);
+    }
 
     float steps = float(uMaxStepCount);
     steps = max(steps, 1.0);
@@ -395,6 +429,7 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
     vec3 transmittanceToView = vec3(1.0);
     float depthWeightedSum = 0.0;
     float depthWeightsSum = 0.0;
+    float lightVisibilityWeightedSum = 0.0;
 
     float transmittanceThreshold = uTransmittanceThreshold;
     float sunDirectionLength = length(uSunDirection);
@@ -459,7 +494,8 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
                                 accumulatedLuminance,
                                 transmittanceToView,
                                 depthWeightedSum,
-                                depthWeightsSum);
+                                depthWeightsSum,
+                                lightVisibilityWeightedSum);
 
         float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
         if (minTransmittance <= transmittanceThreshold)
@@ -472,9 +508,11 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
     float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
     float alpha = clamp(1.0 - minTransmittance, 0.0, 1.0);
 
+    float tDepth = 0.0;
+
     if (depthWeightsSum > 0.0)
     {
-        float tDepth = depthWeightedSum / depthWeightsSum;
+        tDepth = depthWeightedSum / depthWeightsSum;
         float atmosphereBlend = CalculateAtmosphereBlend(tDepth);
         float fadeFactor = 1.0 - atmosphereBlend;
 
@@ -492,12 +530,34 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin, vec3 rayDirection)
         }
     }
 
+    // Populate training outputs -------------------------------------------------------------------
+    outViewTransmittance = minTransmittance;
+
+    if (depthWeightsSum > 0.0)
+    {
+        outLightTransmittance = lightVisibilityWeightedSum / depthWeightsSum;
+        outLinearDepth = tDepth;
+    }
+    else
+    {
+        outLightTransmittance = 1.0;
+        outLinearDepth = 0.0;
+    }
+
     return vec4(finalLuminance, alpha);
 }
 
-vec4 RenderClouds(vec3 rayOrigin, vec3 rayDirection)
+vec4 RenderClouds(vec3 rayOrigin,
+                  vec3 rayDirection,
+                  out float outViewTransmittance,
+                  out float outLightTransmittance,
+                  out float outLinearDepth)
 {
-    vec4 clouds = RaymarchCloudLayer(rayOrigin, rayDirection);
+    vec4 clouds = RaymarchCloudLayer(rayOrigin,
+                                     rayDirection,
+                                     outViewTransmittance,
+                                     outLightTransmittance,
+                                     outLinearDepth);
 
     // Simple premultiplied alpha to blend with background
     clouds.rgb = clamp(clouds.rgb, 0.0, 1.0);
@@ -520,6 +580,7 @@ void main()
     // Debug switch: 0 = shape, 1 = detail, 2 = curl, 3 = weather, 4 = full clouds
     const int DebugOutput = 4;
     vec4 result = vec4(0.0);
+    vec4 dataResult = vec4(0.0);
     if (DebugOutput == 0)
     {
         result = texture(ShapeNoiseTexture, vec3(uv, 0.0));
@@ -548,8 +609,22 @@ void main()
         vec3 rayOrigin = CameraPosition;
         vec3 rayDirection = normalize(worldFar.xyz - rayOrigin);
 
-        result = RenderClouds(rayOrigin, rayDirection);
+        float viewTransmittance = 1.0;
+        float lightTransmittance = 1.0;
+        float linearDepth = 0.0;
+
+        result = RenderClouds(rayOrigin,
+                              rayDirection,
+                              viewTransmittance,
+                              lightTransmittance,
+                              linearDepth);
+
+        dataResult = vec4(viewTransmittance,
+                          lightTransmittance,
+                          linearDepth,
+                          1.0);
     }
 
     imageStore(outputImage, texelCoord, result);
+    imageStore(dataOutputImage, texelCoord, dataResult);
 }

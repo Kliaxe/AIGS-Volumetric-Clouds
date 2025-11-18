@@ -42,6 +42,16 @@ class TrainConfig:
     model_bilinear: bool = True
     model_learn_residual: bool = True
 
+    # Auxiliary input feature toggles --------------------------------
+    # When enabled, the dataset will read *_low_data.pfm and concatenate the
+    # corresponding channels to the RGB input before feeding it to the U-Net.
+    use_view_transmittance: bool = True
+    use_light_transmittance: bool = True
+    use_linear_depth: bool = True
+
+    # Normalisation scale for the linear depth channel (world units).
+    depth_normalization_max: float = 40000.0
+
 
 def _select_device(spec: str) -> torch.device:
     if spec == "auto":
@@ -80,6 +90,10 @@ def train_unet(config: TrainConfig) -> None:
         crop_size=config.crop_size,
         limit_pairs=config.limit_pairs,
         upsample_mode="bicubic",
+        use_view_transmittance=config.use_view_transmittance,
+        use_light_transmittance=config.use_light_transmittance,
+        use_linear_depth=config.use_linear_depth,
+        depth_normalization_max=config.depth_normalization_max,
     )
     dataset = CloudPairDataset(ds_conf)
     loader = DataLoader(
@@ -99,13 +113,22 @@ def train_unet(config: TrainConfig) -> None:
     print("===============================================================")
 
     # ----------------- Model & Optim -----------------
-    # Build a U‑Net that takes a 3‑channel RGB input at high resolution
-    # (upsampled low-res frame) and predicts a refined 3‑channel RGB output.
+    # Build a U‑Net that takes an N‑channel input at high resolution
+    # (upsampled low-res frame plus optional auxiliary channels) and predicts
+    # a refined 3‑channel RGB output.
     # learn_residual=True makes the model add a learned residual on top of the
     # upsampled input, which stabilizes training for super‑resolution/refinement.
+    in_channels = 3
+    if config.use_view_transmittance:
+        in_channels += 1
+    if config.use_light_transmittance:
+        in_channels += 1
+    if config.use_linear_depth:
+        in_channels += 1
+
     model = UNet(
         UNetConfig(
-            in_channels=3,
+            in_channels=in_channels,
             out_channels=3,
             base_channels=config.model_base_channels,
             bilinear=config.model_bilinear,
@@ -135,7 +158,7 @@ def train_unet(config: TrainConfig) -> None:
         f"depth={depth_levels} | "
         f"levels={channels_per_level} | "
         f"convs={num_convs} | bns={num_bns} | "
-        f"lr={config.learning_rate:.2e} | device={device.type} | "
+        f"in_ch={in_channels} | lr={config.learning_rate:.2e} | device={device.type} | "
         f"bilinear_up={config.model_bilinear} | residual={config.model_learn_residual}"
     )
 
@@ -152,9 +175,9 @@ def train_unet(config: TrainConfig) -> None:
 
         for batch_idx, batch in enumerate(loader):
             # Fetch batch
-            # low_up: upsampled low‑res to high‑res input  [B, 3, H, W]
+            # low_up: upsampled low‑res to high‑res input  [B, C_in, H, W]
             # high:   ground truth high‑res target         [B, 3, H, W]
-            low_up = batch["low_up"].to(device, non_blocking=True)   # [B, 3, H, W]
+            low_up = batch["low_up"].to(device, non_blocking=True)   # [B, C_in, H, W]
             high = batch["high"].to(device, non_blocking=True)       # [B, 3, H, W]
 
             # Forward pass: predict refined image (residual added inside the model)

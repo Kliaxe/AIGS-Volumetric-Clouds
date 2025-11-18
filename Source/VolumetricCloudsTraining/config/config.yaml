@@ -19,6 +19,12 @@ train:
   model_bilinear: true
   model_learn_residual: true
 
+  # Auxiliary feature usage ---------------------------------------------------
+  use_view_transmittance: true
+  use_light_transmittance: true
+  use_linear_depth: true
+  depth_normalization_max: 70000.0
+
   # Runtime behaviour ---------------------------------------------------------
   num_workers: 0
   device: cuda
@@ -51,4 +57,10 @@ infer:
   clamp_min: 0.0
   clamp_max: 1.0
   scale_factor: 4
+
+  # Auxiliary feature usage (must match training) -------------------------------
+  use_view_transmittance: true
+  use_light_transmittance: true
+  use_linear_depth: true
+  depth_normalization_max: 70000.0  # Match training max distance
 

@@ -240,6 +240,11 @@ std::shared_ptr<Texture2DObject> VolumetricCloudsRenderPass::GetOutputTexture() 
     return m_outputTexture;
 }
 
+std::shared_ptr<Texture2DObject> VolumetricCloudsRenderPass::GetDataTexture() const
+{
+    return m_dataTexture;
+}
+
 int VolumetricCloudsRenderPass::GetOutputWidth() const
 {
     return m_outputWidth;
@@ -257,6 +262,8 @@ void VolumetricCloudsRenderPass::EnsureOutputTextureSized(int width, int height)
 
     m_outputWidth = width;
     m_outputHeight = height;
+
+    // Colour output -------------------------------------------------------------------------------
     m_outputTexture = std::make_shared<Texture2DObject>();
     m_outputTexture->Bind();
     m_outputTexture->SetImage(0, width, height, TextureObject::FormatRGBA, TextureObject::InternalFormatRGBA32F);
@@ -264,6 +271,16 @@ void VolumetricCloudsRenderPass::EnsureOutputTextureSized(int width, int height)
     m_outputTexture->SetParameter(TextureObject::ParameterEnum::MagFilter, GL_NEAREST);
     m_outputTexture->SetParameter(TextureObject::ParameterEnum::WrapS, GL_CLAMP_TO_EDGE);
     m_outputTexture->SetParameter(TextureObject::ParameterEnum::WrapT, GL_CLAMP_TO_EDGE);
+    Texture2DObject::Unbind();
+
+    // Auxiliary data output -----------------------------------------------------------------------
+    m_dataTexture = std::make_shared<Texture2DObject>();
+    m_dataTexture->Bind();
+    m_dataTexture->SetImage(0, width, height, TextureObject::FormatRGBA, TextureObject::InternalFormatRGBA32F);
+    m_dataTexture->SetParameter(TextureObject::ParameterEnum::MinFilter, GL_NEAREST);
+    m_dataTexture->SetParameter(TextureObject::ParameterEnum::MagFilter, GL_NEAREST);
+    m_dataTexture->SetParameter(TextureObject::ParameterEnum::WrapS, GL_CLAMP_TO_EDGE);
+    m_dataTexture->SetParameter(TextureObject::ParameterEnum::WrapT, GL_CLAMP_TO_EDGE);
     Texture2DObject::Unbind();
 }
 
@@ -506,6 +523,11 @@ void VolumetricCloudsRenderPass::Render()
     if (m_weatherMapTexture && m_weatherSamplerLocation >= 0) m_computeProgram.SetTexture(m_weatherSamplerLocation, weatherTextureUnit, *m_weatherMapTexture);
 
     m_outputTexture->BindImageTexture(0,0, GL_FALSE,0, GL_WRITE_ONLY, TextureObject::InternalFormatRGBA32F);
+
+    if (m_dataTexture)
+    {
+        m_dataTexture->BindImageTexture(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, TextureObject::InternalFormatRGBA32F);
+    }
     {
         const GLuint gx = (viewport.z + 15) /16;
         const GLuint gy = (viewport.w + 15) /16;

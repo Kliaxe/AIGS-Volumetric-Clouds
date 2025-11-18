@@ -303,14 +303,36 @@ TrainingFrameWriter::FrameCapture TrainingCaptureRunner::CaptureResolution(const
     }
 
     const std::size_t totalPixels = static_cast<std::size_t>(resolution.x) * resolution.y;
-    capture.rgbaPixels.resize(totalPixels * 4U);
+
+    // ----------------------------------------------------------------------------------------------
+    // Read back colour buffer
+    // ----------------------------------------------------------------------------------------------
+    capture.rgbaColorPixels.resize(totalPixels * 4U);
 
     TextureObject::SetActiveTexture(0);
     outputTexture->Bind();
     outputTexture->GetTextureData(0,
                                   TextureObject::FormatRGBA,
                                   Data::Type::Float,
-                                  capture.rgbaPixels.data());
+                                  capture.rgbaColorPixels.data());
+
+    // ----------------------------------------------------------------------------------------------
+    // Read back auxiliary data buffer (if available)
+    // ----------------------------------------------------------------------------------------------
+    const std::shared_ptr<Texture2DObject> dataTexture = m_cloudsPass.GetDataTexture();
+
+    if (dataTexture)
+    {
+        capture.rgbaDataPixels.resize(totalPixels * 4U);
+
+        TextureObject::SetActiveTexture(0);
+        dataTexture->Bind();
+        dataTexture->GetTextureData(0,
+                                    TextureObject::FormatRGBA,
+                                    Data::Type::Float,
+                                    capture.rgbaDataPixels.data());
+        Texture2DObject::Unbind();
+    }
     Texture2DObject::Unbind();
 
     return capture;

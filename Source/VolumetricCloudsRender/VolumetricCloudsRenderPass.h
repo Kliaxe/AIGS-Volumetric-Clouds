@@ -38,6 +38,7 @@ public:
     int GetMaxStepCount() const;
 
     std::shared_ptr<Texture2DObject> GetOutputTexture() const;
+    std::shared_ptr<Texture2DObject> GetDataTexture() const;
     int GetOutputWidth() const;
     int GetOutputHeight() const;
 
@@ -98,7 +99,14 @@ private:
     std::shared_ptr<Texture3DObject> m_detailNoiseVolume; // generated detail noise3D (RGBA32F)
     std::shared_ptr<Texture2DObject> m_curlNoiseTexture; // generated curl noise2D (RGBA32F)
     std::shared_ptr<Texture2DObject> m_weatherMapTexture; // generated weather map (RGBA32F)
-    std::shared_ptr<Texture2DObject> m_outputTexture; // final output (RGBA32F)
+
+    // Main colour output written by the render compute shader (RGBA32F)
+    std::shared_ptr<Texture2DObject> m_outputTexture;
+
+    // Auxiliary data output written alongside the colour buffer. This stores training features
+    // such as view transmittance, light transmittance, and linear depth for the current frame.
+    std::shared_ptr<Texture2DObject> m_dataTexture;
+
     int m_outputWidth =0;
     int m_outputHeight =0;
     int m_shapeWidth =0;

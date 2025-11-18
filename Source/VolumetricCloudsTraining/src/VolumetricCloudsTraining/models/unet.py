@@ -216,8 +216,12 @@ class UNet(nn.Module):
         pred = self.outc(x)
 
         if self._config.learn_residual:
-            # Residual refinement: output = clamp(input + residual, [0,1])
-            return torch.clamp(pred + x_in, 0.0, 1.0)
+            # Residual refinement: output = clamp(rgb_input + residual, [0,1]).
+            # When the network has more input channels than output channels
+            # (e.g. RGB + auxiliary features), only the first out_channels are
+            # treated as the base image that the residual refines.
+            residual_base = x_in[:, : self._config.out_channels, ...]
+            return torch.clamp(pred + residual_base, 0.0, 1.0)
         return pred
 
 
