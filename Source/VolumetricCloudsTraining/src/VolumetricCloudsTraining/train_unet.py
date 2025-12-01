@@ -1,4 +1,5 @@
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,9 +12,9 @@ import matplotlib
 # Use a non-interactive backend for environments without a display (e.g., CI/headless)
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from .dataset_cloud_pairs import CloudPairDataset, CloudPairDatasetConfig
+from .dataset_cloud_pairs import CloudPairDataset, CloudPairDatasetConfig, compute_dataset_index_splits
 from .models.unet import UNet, UNetConfig
 from .pfm_io import write_pfm
 
@@ -35,8 +36,26 @@ class TrainConfig:
     num_workers: int = 0  # Windows default safer
     device: str = "auto"  # 'auto' | 'cuda' | 'cpu'
     seed: int = 42
+    # Dataset split configuration -----------------------------------------------
+    train_fraction: float = 0.8
+    val_fraction: float = 0.1
+    test_fraction: float = 0.1
+    split_seed: int = 12345
+    # Logging / export behaviour -------------------------------------------------
+    # When > 0, loss curves (PNG + TXT) are exported every export_every_n_epochs
+    # epochs as well as at the final epoch. When 0, export occurs only at the
+    # final epoch.
+    export_every_n_epochs: int = 0
+    # Epoch checkpoint stride: save a checkpoint every N epochs (always saves
+    # the final epoch checkpoint regardless of this value).
+    save_epoch_stride: int = 1
     save_every_n_steps: int = 200
     log_every_n_steps: int = 20
+    # Checkpointing behaviour ----------------------------------------------------
+    # When True, only the final epoch checkpoint is saved (no intermediate step
+    # or per‑epoch checkpoints). Useful for very long runs where you only care
+    # about the last model state.
+    save_only_last_epoch: bool = False
     # Model configuration --------------------------------------------
     model_base_channels: int = 64
     model_bilinear: bool = True
@@ -48,9 +67,17 @@ class TrainConfig:
     use_view_transmittance: bool = True
     use_light_transmittance: bool = True
     use_linear_depth: bool = True
+    # When enabled, the dataset will read *_low_normals.pfm and concatenate the
+    # three RGB normal channels to the input after any scalar auxiliary channels.
+    use_normals: bool = False
 
     # Normalisation scale for the linear depth channel (world units).
     depth_normalization_max: float = 40000.0
+
+    # Loss configuration ---------------------------------------------
+    # When True, auxiliary channels are used to weight the per‑pixel L1 loss.
+    # Default is False, which uses a plain, unweighted L1 loss on RGB only.
+    use_auxiliary_in_loss: bool = False
 
 
 def _select_device(spec: str) -> torch.device:
@@ -71,6 +98,182 @@ def _ensure_dirs(base: str) -> None:
     os.makedirs(base, exist_ok=True)
     os.makedirs(os.path.join(base, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(base, "logs"), exist_ok=True)
+
+
+def _compute_auxiliary_weights(low_up: torch.Tensor, config: TrainConfig) -> torch.Tensor:
+    """
+    Derive a simple per‑pixel weighting map from the auxiliary channels present in low_up.
+
+    Channel layout in low_up:
+      - [0:3]: RGB input
+      - [3: ]: optional scalar auxiliary channels in the order:
+               view_transmittance, light_transmittance, linear_depth (normalised)
+      - [...]: optional RGB normal channels (when use_normals is enabled), appended
+               after the scalar auxiliary channels.
+
+    The returned tensor has shape [B, 1, H, W] and is used to weight the L1 loss.
+    """
+    b, c, h, w = low_up.shape
+    device = low_up.device
+    dtype = low_up.dtype
+
+    # Start with uniform weights = 1 everywhere.
+    weights = torch.ones((b, 1, h, w), device=device, dtype=dtype)
+
+    # No auxiliary channels configured -> keep uniform weighting.
+    if not (
+        config.use_view_transmittance
+        or config.use_light_transmittance
+        or config.use_linear_depth
+        or config.use_normals
+    ):
+        return weights
+
+    # Extract auxiliary slices based on the same ordering used when building low_up.
+    cursor = 3
+    scalar_components: list[torch.Tensor] = []
+
+    if config.use_view_transmittance and cursor < c:
+        scalar_components.append(low_up[:, cursor : cursor + 1])
+        cursor += 1
+    if config.use_light_transmittance and cursor < c:
+        scalar_components.append(low_up[:, cursor : cursor + 1])
+        cursor += 1
+    if config.use_linear_depth and cursor < c:
+        scalar_components.append(low_up[:, cursor : cursor + 1])
+
+    # Derive a difficulty map from scalar auxiliaries: low transmittance / high depth
+    # -> larger difficulty values.
+    difficulty_scalar: Optional[torch.Tensor]
+    if scalar_components:
+        aux_stack = torch.cat(scalar_components, dim=1)  # [B, C_aux, H, W]
+        aux_mean = aux_stack.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        difficulty_scalar = 1.0 - aux_mean
+    else:
+        difficulty_scalar = None
+
+    # Derive a structure map from normals when present: strong non-zero normals
+    # inside clouds should contribute more than zero-valued background.
+    normals_strength: Optional[torch.Tensor]
+    if config.use_normals and cursor < c:
+        normals_end = min(cursor + 3, c)
+        normals_slice = low_up[:, cursor:normals_end, :, :]
+        normals_strength = torch.abs(normals_slice).mean(dim=1, keepdim=True)  # [B, 1, H, W]
+    else:
+        normals_strength = None
+
+    if difficulty_scalar is None and normals_strength is None:
+        return weights
+
+    # Example scheme:
+    #  - difficulty_scalar emphasises pixels with low T / high depth.
+    #  - normals_strength emphasises pixels with strong normal signal (clouds).
+    #  - When both are present we combine them multiplicatively so that pixels
+    #    that are both "difficult" and "structured" receive the highest weight.
+    if difficulty_scalar is not None and normals_strength is not None:
+        combined = difficulty_scalar * normals_strength
+    elif difficulty_scalar is not None:
+        combined = difficulty_scalar
+    else:
+        combined = normals_strength
+
+    weights = 1.0 + combined
+    weights = torch.clamp(weights, 0.5, 2.0)
+    return weights
+
+
+def _export_loss_curves(
+    step_indices: list[int],
+    step_losses: list[float],
+    epoch_steps: list[int],
+    epoch_train_losses: list[float],
+    epoch_val_losses: list[float],
+    logs_dir: str,
+) -> None:
+    """
+    Export training loss history both as a PNG plot and as a plain text file.
+
+    The text file stores one "step loss" pair per line so that external tools
+    can easily parse and re-plot the curve.
+    """
+    if len(step_losses) == 0:
+        return
+
+    # Plot and save image -------------------------------------------------------
+    fig = plt.figure(figsize=(8, 4.5), dpi=120)
+
+    # Convert to NumPy for easier analysis of scales.
+    step_losses_np = np.asarray(step_losses, dtype=np.float64)
+    epoch_train_np = np.asarray(epoch_train_losses, dtype=np.float64)
+    epoch_val_np = np.asarray(epoch_val_losses, dtype=np.float64)
+
+    # Per-step training loss (dense curve)
+    plt.plot(step_indices, step_losses_np, label="Train step loss", color="tab:blue", linewidth=1.25)
+
+    # Per-epoch averages (sparser curves, plotted at the step reached at end of epoch)
+    if len(epoch_steps) > 0 and len(epoch_train_losses) == len(epoch_steps):
+        plt.plot(
+            epoch_steps,
+            epoch_train_np,
+            label="Train epoch avg",
+            color="tab:green",
+            linewidth=1.25,
+            marker="o",
+            markersize=3,
+        )
+
+    if len(epoch_steps) > 0 and len(epoch_val_losses) > 0:
+        count = min(len(epoch_steps), len(epoch_val_losses))
+        if count > 0:
+            plt.plot(
+                epoch_steps[:count],
+                epoch_val_np[:count],
+                label="Val epoch avg",
+                color="tab:orange",
+                linewidth=1.25,
+                marker="s",
+                markersize=3,
+            )
+
+    # Use a logarithmic y-axis so that early large losses and late small losses
+    # are visible in the same plot. For easier visual comparison across runs,
+    # keep the y‑axis limits deterministic instead of data‑dependent.
+    plt.yscale("log")
+    # Fixed limits can be tweaked here if needed; they apply to all experiments.
+    plt.ylim(bottom=5e-3, top=1e-1)
+
+    plt.xlabel("Step")
+    plt.ylabel("L1 Loss (log scale)")
+    plt.title("Training / validation loss")
+    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    png_path = os.path.join(logs_dir, "loss_curve.png")
+    plt.savefig(png_path)
+    plt.close(fig)
+
+    # Plain text export:
+    #  - Section 1: per-step training loss ("step train_loss")
+    #  - Section 2: per-epoch averages ("epoch_step train_epoch_avg val_epoch_avg")
+    txt_path = os.path.join(logs_dir, "loss_curve.txt")
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write("# Per-step training loss\n")
+        handle.write("# step train_loss\n")
+        for step, loss in zip(step_indices, step_losses):
+            handle.write(f"{step} {loss:.8f}\n")
+
+        handle.write("\n# Per-epoch average losses\n")
+        handle.write("# epoch_step train_epoch_avg val_epoch_avg\n")
+
+        max_count = max(len(epoch_steps), len(epoch_train_losses), len(epoch_val_losses))
+        for i in range(max_count):
+            step_val = epoch_steps[i] if i < len(epoch_steps) else -1
+            train_val = epoch_train_losses[i] if i < len(epoch_train_losses) else float("nan")
+            val_val = epoch_val_losses[i] if i < len(epoch_val_losses) else float("nan")
+            handle.write(f"{step_val} {train_val:.8f} {val_val:.8f}\n")
+
+    print(f"Saved training loss plot: {png_path}")
+    print(f"Saved training loss txt:  {txt_path}")
 
 
 def train_unet(config: TrainConfig) -> None:
@@ -96,18 +299,50 @@ def train_unet(config: TrainConfig) -> None:
         depth_normalization_max=config.depth_normalization_max,
     )
     dataset = CloudPairDataset(ds_conf)
-    loader = DataLoader(
-        dataset,
+
+    # Split underlying dataset indices into train/val/test so that we can
+    # monitor generalisation and later run inference on the exact same splits.
+    num_samples = len(dataset)
+    train_indices, val_indices, test_indices = compute_dataset_index_splits(
+        num_samples=num_samples,
+        train_fraction=config.train_fraction,
+        val_fraction=config.val_fraction,
+        test_fraction=config.test_fraction,
+        split_seed=config.split_seed,
+    )
+
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices) if len(val_indices) > 0 else None
+    test_dataset = Subset(dataset, test_indices) if len(test_indices) > 0 else None
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=(device.type == "cuda"),
     )
+    val_loader = (
+        DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        if val_dataset is not None
+        else None
+    )
 
-    num_samples = len(dataset)
-    num_batches = (num_samples + config.batch_size - 1) // max(1, config.batch_size)
+    train_num_samples = len(train_dataset)
+    train_num_batches = (train_num_samples + config.batch_size - 1) // max(1, config.batch_size)
+    total_steps = train_num_batches * max(1, config.epochs)  # total training steps across all epochs
     print("===============================================================")
-    print(f"Dataset: {num_samples} pairs | batch_size={config.batch_size} | batches/epoch={num_batches}")
+    print(
+        f"Dataset: {num_samples} pairs "
+        f"(train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}) | "
+        f"batch_size={config.batch_size} | train_batches/epoch={train_num_batches}"
+    )
     print(f"Crop size: {config.crop_size} | Upsample: {ds_conf.upsample_mode}")
     print(f"Output: {config.output_dir} | Checkpoints: {ckpt_dir}")
     print("===============================================================")
@@ -125,6 +360,9 @@ def train_unet(config: TrainConfig) -> None:
         in_channels += 1
     if config.use_linear_depth:
         in_channels += 1
+    if config.use_normals:
+        # RGB normals contribute three additional channels.
+        in_channels += 3
 
     model = UNet(
         UNetConfig(
@@ -141,7 +379,8 @@ def train_unet(config: TrainConfig) -> None:
     # - AdamW: Adam with decoupled weight decay (good general default)
     # - L1 loss: robust to outliers; favors sharper results than L2
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    criterion = torch.nn.L1Loss()
+    # Per‑pixel L1 loss; we apply optional weighting ourselves below.
+    criterion = torch.nn.L1Loss(reduction="none")
 
     num_params = sum(p.numel() for p in model.parameters())
 
@@ -166,6 +405,13 @@ def train_unet(config: TrainConfig) -> None:
     global_step = 0
     step_indices: list[int] = []
     step_losses: list[float] = []
+    epoch_steps: list[int] = []
+    epoch_train_losses: list[float] = []
+    epoch_val_losses: list[float] = []
+
+    # Simple ETA tracking between log events
+    last_log_step: Optional[int] = None
+    last_log_time: Optional[float] = None
 
     # ----------------- Training Loop -----------------
     for epoch in range(1, config.epochs + 1):
@@ -173,7 +419,7 @@ def train_unet(config: TrainConfig) -> None:
         epoch_loss = 0.0  # running sum to compute average epoch loss
         print(f"==> Epoch {epoch}/{config.epochs}")
 
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(train_loader):
             # Fetch batch
             # low_up: upsampled low‑res to high‑res input  [B, C_in, H, W]
             # high:   ground truth high‑res target         [B, 3, H, W]
@@ -184,7 +430,17 @@ def train_unet(config: TrainConfig) -> None:
             pred = model(low_up)
 
             # Compute loss and update weights
-            loss = criterion(pred, high) # loss = L1(prediction, target). Scalar measuring current batch error.
+            per_pixel_loss = criterion(pred, high)  # [B, 3, H, W]
+
+            if config.use_auxiliary_in_loss:
+                # Derive a weighting map from auxiliary channels present in low_up.
+                weights = _compute_auxiliary_weights(low_up, config)  # [B, 1, H, W]
+                weighted = per_pixel_loss * weights
+                loss = weighted.mean()
+            else:
+                # Plain unweighted L1 loss on RGB.
+                loss = per_pixel_loss.mean()
+
             optimizer.zero_grad(set_to_none=True) # zero_grad: clear old gradients on parameters before accumulating new ones.
             loss.backward() # backward: run backpropagation to compute gradients d(loss)/d(parameter).
             optimizer.step() # step: apply the optimizer update rule (AdamW) using the computed gradients.
@@ -196,45 +452,118 @@ def train_unet(config: TrainConfig) -> None:
             step_losses.append(float(loss.item()))
 
             # Logging
-            epoch_processed = min((batch_idx + 1) * config.batch_size, num_samples)
+            epoch_processed = min((batch_idx + 1) * config.batch_size, train_num_samples)
             if global_step % max(1, config.log_every_n_steps) == 0 or batch_idx == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
+
+                # ------------------------------------------------------------
+                # ETA computation based on time between the last and current
+                # log events. This keeps the estimate local in time so it
+                # adapts if training speed changes.
+                # ------------------------------------------------------------
+                now = time.perf_counter()
+                eta_str = "ETA --:--:--"
+
+                if last_log_step is not None and last_log_time is not None:
+                    step_delta = global_step - last_log_step
+                    time_delta = now - last_log_time
+
+                    if step_delta > 0 and time_delta > 0.0:
+                        steps_per_second = step_delta / time_delta
+                        remaining_steps = max(0, total_steps - global_step)
+
+                        if steps_per_second > 0.0:
+                            remaining_seconds = remaining_steps / steps_per_second
+
+                            if np.isfinite(remaining_seconds) and remaining_seconds >= 0.0:
+                                hours = int(remaining_seconds // 3600)
+                                minutes = int((remaining_seconds % 3600) // 60)
+                                seconds = int(remaining_seconds % 60)
+                                eta_str = f"ETA {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+                last_log_step = global_step
+                last_log_time = now
+
                 print(
                     f"[epoch {epoch}/{config.epochs}] "
-                    f"batch {batch_idx + 1}/{num_batches} "
+                    f"batch {batch_idx + 1}/{train_num_batches} "
                     f"(step {global_step}) | "
                     f"samples {epoch_processed}/{num_samples} | "
                     f"loss {loss.item():.6f} | avg {(epoch_loss / (batch_idx + 1)):.6f} | "
-                    f"lr {current_lr:.2e}"
+                    f"lr {current_lr:.2e} | {eta_str}"
                 )
 
-            # Periodically save a checkpoint
-            if global_step % config.save_every_n_steps == 0:
-                ckpt_path = os.path.join(ckpt_dir, f"unet_step_{global_step}.pt")
-                torch.save(model.state_dict(), ckpt_path)
-                print(f"Saved checkpoint: {ckpt_path}")
+            # Periodically save a checkpoint (disabled when we only want the
+            # final epoch checkpoint to avoid filling disk with intermediates).
+            if (not config.save_only_last_epoch) and config.save_every_n_steps > 0:
+                if global_step % config.save_every_n_steps == 0:
+                    ckpt_path = os.path.join(ckpt_dir, f"unet_step_{global_step}.pt")
+                    torch.save(model.state_dict(), ckpt_path)
+                    print(f"Saved checkpoint: {ckpt_path}")
 
-        # End‑of‑epoch reporting
-        avg_loss = epoch_loss / max(1, len(loader))
-        print(f"Epoch {epoch}/{config.epochs} - avg loss: {avg_loss:.6f}")
+        # End‑of‑epoch reporting on training set
+        avg_loss = epoch_loss / max(1, len(train_loader))
+        print(f"Epoch {epoch}/{config.epochs} - train avg loss: {avg_loss:.6f}")
 
-        # Save checkpoint at end of epoch (always have a recent stable checkpoint)
-        epoch_ckpt_path = os.path.join(ckpt_dir, f"unet_epoch_{epoch}.pt")
-        torch.save(model.state_dict(), epoch_ckpt_path)
-        print(f"Saved epoch checkpoint: {epoch_ckpt_path}")
+        # Record epoch-level training statistics at the step reached at end of epoch.
+        epoch_steps.append(global_step)
+        epoch_train_losses.append(avg_loss)
 
-    # ----------------- Post Training: Save Loss Curve & CSV -----------------
-    if len(step_losses) > 0:
-        # Save plot
-        fig = plt.figure(figsize=(8, 4.5), dpi=120)
-        plt.plot(step_indices, step_losses, label="Step Loss", color="tab:blue", linewidth=1.25)
-        plt.xlabel("Step")
-        plt.ylabel("L1 Loss")
-        plt.title("Training Loss")
-        plt.grid(True, which="both", linestyle="--", alpha=0.4)
-        plt.legend(loc="best")
-        plt.tight_layout()
-        png_path = os.path.join(logs_dir, "loss_curve.png")
-        plt.savefig(png_path)
-        plt.close(fig)
-        print(f"Saved training loss plot: {png_path}")
+        # ----------------- Validation Loop -----------------
+        if val_loader is not None:
+            model.eval()
+            val_loss_sum = 0.0
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_low_up = val_batch["low_up"].to(device, non_blocking=True)
+                    val_high = val_batch["high"].to(device, non_blocking=True)
+                    val_pred = model(val_low_up)
+
+                    val_per_pixel = criterion(val_pred, val_high)  # [B, 3, H, W]
+                    if config.use_auxiliary_in_loss:
+                        val_weights = _compute_auxiliary_weights(val_low_up, config)  # [B, 1, H, W]
+                        val_weighted = val_per_pixel * val_weights
+                        val_loss = val_weighted.mean()
+                    else:
+                        val_loss = val_per_pixel.mean()
+
+                    val_loss_sum += float(val_loss.item())
+
+            val_avg_loss = val_loss_sum / max(1, len(val_loader))
+            epoch_val_losses.append(val_avg_loss)
+            print(f"Epoch {epoch}/{config.epochs} - val   avg loss: {val_avg_loss:.6f}")
+
+        # Save checkpoint at end of epoch.
+        # - Default: save every epoch.
+        # - save_epoch_stride>1: save only every Nth epoch plus the final epoch.
+        # - save_only_last_epoch=True: only write a checkpoint for the final epoch.
+        save_epoch_ckpt = False
+        if not config.save_only_last_epoch:
+            if config.save_epoch_stride <= 0:
+                # Non‑positive stride interpreted as "save every epoch".
+                save_epoch_ckpt = True
+            elif (epoch % config.save_epoch_stride) == 0:
+                save_epoch_ckpt = True
+        if epoch == config.epochs:
+            save_epoch_ckpt = True
+
+        if save_epoch_ckpt:
+            epoch_ckpt_path = os.path.join(ckpt_dir, f"unet_epoch_{epoch}.pt")
+            torch.save(model.state_dict(), epoch_ckpt_path)
+            print(f"Saved epoch checkpoint: {epoch_ckpt_path}")
+
+        # Periodic export of loss history (PNG + TXT). Always export at the final epoch,
+        # and also every config.export_every_n_epochs when that value is > 0.
+        should_export = (epoch == config.epochs)
+        if config.export_every_n_epochs > 0 and (epoch % config.export_every_n_epochs == 0):
+            should_export = True
+
+        if should_export:
+            _export_loss_curves(
+                step_indices=step_indices,
+                step_losses=step_losses,
+                epoch_steps=epoch_steps,
+                epoch_train_losses=epoch_train_losses,
+                epoch_val_losses=epoch_val_losses,
+                logs_dir=logs_dir,
+            )

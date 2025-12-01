@@ -49,7 +49,7 @@ void TextureObject::GenerateMipmap()
 
 void TextureObject::GenerateMipChain(MipGenFilter filter)
 {
-    assert(IsBound());
+    Bind();
 
     // Query the dimensions of the base level so we can compute how many mip levels we need
     GLint width = 1;

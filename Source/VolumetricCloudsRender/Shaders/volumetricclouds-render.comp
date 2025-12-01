@@ -17,6 +17,10 @@ layout(rgba32f, binding = 0) uniform image2D outputImage;
 //      A: reserved (currently 1.0)
 layout(rgba32f, binding = 1) uniform image2D dataOutputImage;
 
+// Per-pixel normal output -------------------------------------------------------------------------
+//  Stores cloud normals in RGB (world-space) with a constant alpha of 1.0.
+layout(rgba32f, binding = 2) uniform image2D normalsOutputImage;
+
 // -------------------------------------------------------------------------
 //    Uniforms
 // -------------------------------------------------------------------------
@@ -32,6 +36,14 @@ uniform vec3 CameraPosition;
 // -------------------------------------------------------------------------
 //    Helpers
 // -------------------------------------------------------------------------
+
+const float PI = 3.14159265359;
+const float INV_FOUR_PI = 0.07957747154594767;
+
+const int MS_COUNT = 2;
+const float CLOUD_DENSITY_THRESHOLD = 0.001;
+const float NORMAL_MIN_PROBE_DISTANCE = 150.0;
+const float NORMAL_GRADIENT_EPSILON = 0.0001;
 
 vec2 RaySphereIntersect(vec3 rayOrigin, vec3 rayDirection, vec3 sphereCenter, float sphereRadius)
 {
@@ -55,15 +67,59 @@ float ComputeHeightFraction(vec3 position)
     return height / uCloudThickness;
 }
 
+float SampleDensityForNormal(vec3 position, CloudLayer cloudLayer, float lod)
+{
+    float heightFraction = GetHeightFractionForPoint(position);
+    if (heightFraction < 0.0 || heightFraction > 1.0)
+    {
+        return 0.0;
+    }
+
+    vec3 weatherData = SampleWeather(WeatherMapTexture, position, heightFraction, cloudLayer);
+    if (!ValidCloudDensity(heightFraction, weatherData))
+    {
+        return 0.0;
+    }
+
+    return SampleCloudDensity(ShapeNoiseTexture,
+                              DetailNoiseTexture,
+                              CurlNoiseTexture,
+                              position,
+                              heightFraction,
+                              cloudLayer,
+                              weatherData,
+                              lod,
+                              true);
+}
+
+vec3 EstimateCloudNormal(vec3 position, float stepSize, CloudLayer cloudLayer, float lod)
+{
+    float probeDistance = max(stepSize * 0.5, NORMAL_MIN_PROBE_DISTANCE);
+    float normalLod = clamp(lod + 0.5, uLODMin, 3.0);
+
+    float densityPosX = SampleDensityForNormal(position + vec3(probeDistance, 0.0, 0.0), cloudLayer, normalLod);
+    float densityNegX = SampleDensityForNormal(position - vec3(probeDistance, 0.0, 0.0), cloudLayer, normalLod);
+    float densityPosY = SampleDensityForNormal(position + vec3(0.0, probeDistance, 0.0), cloudLayer, normalLod);
+    float densityNegY = SampleDensityForNormal(position - vec3(0.0, probeDistance, 0.0), cloudLayer, normalLod);
+    float densityPosZ = SampleDensityForNormal(position + vec3(0.0, 0.0, probeDistance), cloudLayer, normalLod);
+    float densityNegZ = SampleDensityForNormal(position - vec3(0.0, 0.0, probeDistance), cloudLayer, normalLod);
+
+    vec3 gradient = vec3(densityPosX - densityNegX,
+                         densityPosY - densityNegY,
+                         densityPosZ - densityNegZ);
+
+    float gradientLength = length(gradient);
+    if (gradientLength <= NORMAL_GRADIENT_EPSILON)
+    {
+        return vec3(0.0);
+    }
+
+    return -(gradient / gradientLength);
+}
+
 // -------------------------------------------------------------------------
 //    Lighting Helpers
 // -------------------------------------------------------------------------
-
-const float PI = 3.14159265359;
-const float INV_FOUR_PI = 0.07957747154594767;
-
-const int MS_COUNT = 2;
-const float CLOUD_DENSITY_THRESHOLD = 0.001;
 
 // Simple white-noise hash. This is used to jitter the starting position of
 // the raymarch per ray when uJitterEnabled is true.
@@ -318,7 +374,9 @@ void VolumetricCloudLighting(vec3 startPosition,
                              inout vec3 transmittanceToView,
                              inout float depthWeightedSum,
                              inout float depthWeightsSum,
-                             inout float lightVisibilityWeightedSum)
+                             inout float lightVisibilityWeightedSum,
+                             inout vec3 normalWeightedSum,
+                             inout float normalWeightsSum)
 {
     vec3 albedo = SampleAlbedo(cloudDensity, weatherData);
     vec3 extinction = SampleExtinction(cloudDensity);
@@ -344,6 +402,17 @@ void VolumetricCloudLighting(vec3 startPosition,
     float depthWeight = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
     depthWeightedSum += depthWeight * length(worldPosition - startPosition);
     depthWeightsSum += depthWeight;
+
+    if (depthWeight > 0.0)
+    {
+        // Estimate per-sample normal using local density gradients
+        vec3 estimatedNormal = EstimateCloudNormal(worldPosition, stepSize, cloudLayer, lod);
+        if (length(estimatedNormal) > 0.0)
+        {
+            normalWeightedSum += depthWeight * estimatedNormal;
+            normalWeightsSum += depthWeight;
+        }
+    }
 
     for (int ms = MS_COUNT - 1; ms >= 0; --ms)
     {
@@ -382,13 +451,16 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
                         vec3 rayDirection,
                         out float outViewTransmittance,
                         out float outLightTransmittance,
-                        out float outLinearDepth)
+                        out float outLinearDepth,
+                        out vec3 outNormal)
 {
     vec3 planetCenterWorldM = uEarthCenter * SKY_UNIT_TO_M;
     float planetRadiusM = uEarthRadius * SKY_UNIT_TO_M;
     float cloudTopRadius = planetRadiusM + uCloudStartHeight + uCloudThickness;
 
     vec2 topSolutions = RaySphereIntersect(rayOrigin, rayDirection, planetCenterWorldM, cloudTopRadius);
+    outNormal = vec3(0.0);
+
     if (topSolutions.x < 0.0 && topSolutions.y < 0.0)
     {
         outViewTransmittance = 1.0;
@@ -405,6 +477,7 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
         outViewTransmittance = 1.0;
         outLightTransmittance = 1.0;
         outLinearDepth = 0.0;
+        outNormal = vec3(0.0);
         return vec4(0.0);
     }
 
@@ -416,6 +489,7 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
         outViewTransmittance = 1.0;
         outLightTransmittance = 1.0;
         outLinearDepth = 0.0;
+        outNormal = vec3(0.0);
         return vec4(0.0);
     }
 
@@ -430,6 +504,8 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
     float depthWeightedSum = 0.0;
     float depthWeightsSum = 0.0;
     float lightVisibilityWeightedSum = 0.0;
+    vec3 normalWeightedSum = vec3(0.0);
+    float normalWeightsSum = 0.0;
 
     float transmittanceThreshold = uTransmittanceThreshold;
     float sunDirectionLength = length(uSunDirection);
@@ -495,7 +571,9 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
                                 transmittanceToView,
                                 depthWeightedSum,
                                 depthWeightsSum,
-                                lightVisibilityWeightedSum);
+                                lightVisibilityWeightedSum,
+                                normalWeightedSum,
+                                normalWeightsSum);
 
         float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
         if (minTransmittance <= transmittanceThreshold)
@@ -505,6 +583,15 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
     }
 
     vec3 finalLuminance = max(accumulatedLuminance, vec3(0.0));
+    vec3 finalNormal = vec3(0.0);
+    if (normalWeightsSum > 0.0)
+    {
+        float normalLength = length(normalWeightedSum);
+        if (normalLength > 0.0)
+        {
+            finalNormal = normalWeightedSum / normalLength;
+        }
+    }
     float minTransmittance = min(transmittanceToView.r, min(transmittanceToView.g, transmittanceToView.b));
     float alpha = clamp(1.0 - minTransmittance, 0.0, 1.0);
 
@@ -544,6 +631,7 @@ vec4 RaymarchCloudLayer(vec3 rayOrigin,
         outLinearDepth = 0.0;
     }
 
+    outNormal = finalNormal;
     return vec4(finalLuminance, alpha);
 }
 
@@ -551,13 +639,15 @@ vec4 RenderClouds(vec3 rayOrigin,
                   vec3 rayDirection,
                   out float outViewTransmittance,
                   out float outLightTransmittance,
-                  out float outLinearDepth)
+                  out float outLinearDepth,
+                  out vec3 outNormal)
 {
     vec4 clouds = RaymarchCloudLayer(rayOrigin,
                                      rayDirection,
                                      outViewTransmittance,
                                      outLightTransmittance,
-                                     outLinearDepth);
+                                     outLinearDepth,
+                                     outNormal);
 
     // Simple premultiplied alpha to blend with background
     clouds.rgb = clamp(clouds.rgb, 0.0, 1.0);
@@ -581,6 +671,7 @@ void main()
     const int DebugOutput = 4;
     vec4 result = vec4(0.0);
     vec4 dataResult = vec4(0.0);
+    vec4 normalsResult = vec4(0.0, 0.0, 0.0, 1.0);
     if (DebugOutput == 0)
     {
         result = texture(ShapeNoiseTexture, vec3(uv, 0.0));
@@ -612,19 +703,23 @@ void main()
         float viewTransmittance = 1.0;
         float lightTransmittance = 1.0;
         float linearDepth = 0.0;
+        vec3 cloudNormal = vec3(0.0);
 
         result = RenderClouds(rayOrigin,
                               rayDirection,
                               viewTransmittance,
                               lightTransmittance,
-                              linearDepth);
+                              linearDepth,
+                              cloudNormal);
 
         dataResult = vec4(viewTransmittance,
                           lightTransmittance,
                           linearDepth,
                           1.0);
+        normalsResult = vec4(cloudNormal, 1.0);
     }
 
     imageStore(outputImage, texelCoord, result);
     imageStore(dataOutputImage, texelCoord, dataResult);
+    imageStore(normalsOutputImage, texelCoord, normalsResult);
 }

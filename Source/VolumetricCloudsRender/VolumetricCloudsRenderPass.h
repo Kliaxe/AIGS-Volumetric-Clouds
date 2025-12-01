@@ -39,6 +39,7 @@ public:
 
     std::shared_ptr<Texture2DObject> GetOutputTexture() const;
     std::shared_ptr<Texture2DObject> GetDataTexture() const;
+    std::shared_ptr<Texture2DObject> GetNormalsTexture() const;
     int GetOutputWidth() const;
     int GetOutputHeight() const;
 
@@ -106,6 +107,9 @@ private:
     // Auxiliary data output written alongside the colour buffer. This stores training features
     // such as view transmittance, light transmittance, and linear depth for the current frame.
     std::shared_ptr<Texture2DObject> m_dataTexture;
+
+    // Per-pixel cloud normal output used by the training capture path.
+    std::shared_ptr<Texture2DObject> m_normalsTexture;
 
     int m_outputWidth =0;
     int m_outputHeight =0;

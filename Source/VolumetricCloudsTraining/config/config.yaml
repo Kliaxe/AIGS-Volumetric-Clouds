@@ -3,52 +3,135 @@
 # ================================================================
 
 # Paths are resolved relative to the project root (next to this config/ folder).
+name: default  # Label for this configuration; used in output paths.
+
+# Common blocks reused by both train / infer -----------------------------------
+common_model: &common_model
+  model_base_channels: 32
+  model_bilinear: true
+  model_learn_residual: true
+
+common_split: &common_split
+  train_fraction: 0.8
+  val_fraction: 0.15
+  test_fraction: 0.05
+  split_seed: 12345
+common_aux: &common_aux
+  use_view_transmittance: false
+  use_light_transmittance: false
+  use_linear_depth: false
+  use_normals: false
+  depth_normalization_max: 70000.0
+
 train:
+  # Merge shared defaults; fields below can override them if needed.
+  <<: [*common_model, *common_split, *common_aux]
+
   data_dir: TrainingCaptures
   output_dir: Outputs
 
   # Training schedule ---------------------------------------------------------
-  epochs: 100
-  batch_size: 32
-  learning_rate: 0.001
+  epochs: 10
+  batch_size: 64
+  learning_rate: 0.0001
   crop_size: 256
-  limit_pairs: null  # use all available pairs
+  limit_pairs: null # null to use all available pairs
 
-  # Model configuration -------------------------------------------------------
-  model_base_channels: 64
-  model_bilinear: true
-  model_learn_residual: true
-
-  # Auxiliary feature usage ---------------------------------------------------
-  use_view_transmittance: true
-  use_light_transmittance: true
-  use_linear_depth: true
-  depth_normalization_max: 70000.0
+  # Loss configuration ---------------------------------------------------------
+  # Default is false, which uses a plain unweighted RGB loss.
+  use_auxiliary_in_loss: true
 
   # Runtime behaviour ---------------------------------------------------------
-  num_workers: 0
+  num_workers: 8
   device: cuda
+  # Save a checkpoint every N epochs (always saves final epoch as well)
+  save_epoch_stride: 5
   save_every_n_steps: 8192
   log_every_n_steps: 256
+  save_only_last_epoch: false
+  export_every_n_epochs: 5 # loss curves (PNG + TXT)
+
+  # Experiment grid -----------------------------------------------------------
+  # Each experiment overrides only the fields it needs. output_dir becomes: <train.output_dir>/<experiment.name>/
+  experiments:
+#    - name: baseline_rgb
+#      use_view_transmittance: false
+#      use_light_transmittance: false
+#      use_linear_depth: false
+#      use_normals: false
+
+#    - name: view_only
+#      use_view_transmittance: true
+#      use_light_transmittance: false
+#      use_linear_depth: false
+#      use_normals: false
+
+#    - name: light_only
+#      use_view_transmittance: false
+#      use_light_transmittance: true
+#      use_linear_depth: false
+#      use_normals: false
+
+#    - name: depth_only
+#      use_view_transmittance: false
+#      use_light_transmittance: false
+#      use_linear_depth: true
+#      use_normals: false
+
+    - name: normals_only
+      use_view_transmittance: false
+      use_light_transmittance: false
+      use_linear_depth: false
+      use_normals: true
+
+#    - name: all_features
+#      use_view_transmittance: true
+#      use_light_transmittance: true
+#      use_linear_depth: true
+#      use_normals: true
 
 infer:
   # Model checkpoint to use for inference
   checkpoint: Outputs/checkpoints/unet_epoch_100.pt
 
   # Model configuration ---------------------------------------------------------
-  # These must match the architecture used during training for the checkpoint
-  model_base_channels: 64
-  model_bilinear: true
-  model_learn_residual: true
+  # Start from shared defaults; override here only if inference should differ.
+  <<: [*common_model, *common_split, *common_aux]
 
   # Input can be a single file or a directory. If a directory, input_glob applies.
+  # When split_mode="custom", input/input_glob behave as before and inference
+  # runs on whatever files match the pattern. When split_mode is one of
+  # {"train","val","test","all"}, input is treated as the dataset root and the
+  # same index split as training is reproduced.
   input: TrainingCaptures
   input_glob: "*_low.pfm"
+  split_mode: test   # "custom" | "train" | "val" | "test" | "all"
+  # When using a split_mode other than "custom", you can optionally restrict
+  # inference to a single sample within the chosen split by providing an index
+  # here. For example: split_mode="test" and split_sample_index=0 will use only
+  # the first test sample. When null or omitted, all samples in the split are
+  # used.
+  split_sample_index: 0
   recursive: false
 
   # Output directory (files will be named <input_basename>_pred.pfm)
   output_dir: Outputs/infer
   output_suffix: "_pred"
+
+  # Optional experiment-aware inference ---------------------------------------
+  # When run_all_checkpoints=true, checkpoints are discovered in checkpoint_dir
+  # using checkpoint_glob and each checkpoint is evaluated on the same input(s).
+  # Outputs are written under:
+  #   output_dir/<experiment_name>/<checkpoint_tag>/<input>_pred.pfm
+  experiment_name: baseline_rgb    # label used in the output folder hierarchy
+  checkpoint_dir: Outputs/baseline_vs_aux_features/experiments/baseline_rgb/checkpoints
+  checkpoint_glob: "unet_epoch_*.pt"
+  run_all_checkpoints: true       # set true to iterate all matching checkpoints
+  # When run_all_experiments is true, main.py will loop over all entries in
+  # train.experiments and, for each one, build an InferConfig that points at:
+  #   Outputs/<name>/experiments/<experiment_name>/checkpoints
+  # experiment_name / checkpoint_dir above are ignored in that mode.
+  run_all_experiments: true
 
   # Runtime behaviour -----------------------------------------------------------
   device: cuda
@@ -57,10 +140,3 @@ infer:
   clamp_min: 0.0
   clamp_max: 1.0
   scale_factor: 4
-
-  # Auxiliary feature usage (must match training) -------------------------------
-  use_view_transmittance: true
-  use_light_transmittance: true
-  use_linear_depth: true
-  depth_normalization_max: 70000.0  # Match training max distance
-

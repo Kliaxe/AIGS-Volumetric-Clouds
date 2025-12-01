@@ -245,6 +245,11 @@ std::shared_ptr<Texture2DObject> VolumetricCloudsRenderPass::GetDataTexture() co
     return m_dataTexture;
 }
 
+std::shared_ptr<Texture2DObject> VolumetricCloudsRenderPass::GetNormalsTexture() const
+{
+    return m_normalsTexture;
+}
+
 int VolumetricCloudsRenderPass::GetOutputWidth() const
 {
     return m_outputWidth;
@@ -263,25 +268,27 @@ void VolumetricCloudsRenderPass::EnsureOutputTextureSized(int width, int height)
     m_outputWidth = width;
     m_outputHeight = height;
 
-    // Colour output -------------------------------------------------------------------------------
-    m_outputTexture = std::make_shared<Texture2DObject>();
-    m_outputTexture->Bind();
-    m_outputTexture->SetImage(0, width, height, TextureObject::FormatRGBA, TextureObject::InternalFormatRGBA32F);
-    m_outputTexture->SetParameter(TextureObject::ParameterEnum::MinFilter, GL_NEAREST);
-    m_outputTexture->SetParameter(TextureObject::ParameterEnum::MagFilter, GL_NEAREST);
-    m_outputTexture->SetParameter(TextureObject::ParameterEnum::WrapS, GL_CLAMP_TO_EDGE);
-    m_outputTexture->SetParameter(TextureObject::ParameterEnum::WrapT, GL_CLAMP_TO_EDGE);
-    Texture2DObject::Unbind();
+    const auto allocateStorageTexture = [width, height]()
+    {
+        auto texture = std::make_shared<Texture2DObject>();
+        texture->Bind();
+        texture->SetImage(0, width, height, TextureObject::FormatRGBA, TextureObject::InternalFormatRGBA32F);
+        texture->SetParameter(TextureObject::ParameterEnum::MinFilter, GL_NEAREST);
+        texture->SetParameter(TextureObject::ParameterEnum::MagFilter, GL_NEAREST);
+        texture->SetParameter(TextureObject::ParameterEnum::WrapS, GL_CLAMP_TO_EDGE);
+        texture->SetParameter(TextureObject::ParameterEnum::WrapT, GL_CLAMP_TO_EDGE);
+        Texture2DObject::Unbind();
+        return texture;
+    };
 
-    // Auxiliary data output -----------------------------------------------------------------------
-    m_dataTexture = std::make_shared<Texture2DObject>();
-    m_dataTexture->Bind();
-    m_dataTexture->SetImage(0, width, height, TextureObject::FormatRGBA, TextureObject::InternalFormatRGBA32F);
-    m_dataTexture->SetParameter(TextureObject::ParameterEnum::MinFilter, GL_NEAREST);
-    m_dataTexture->SetParameter(TextureObject::ParameterEnum::MagFilter, GL_NEAREST);
-    m_dataTexture->SetParameter(TextureObject::ParameterEnum::WrapS, GL_CLAMP_TO_EDGE);
-    m_dataTexture->SetParameter(TextureObject::ParameterEnum::WrapT, GL_CLAMP_TO_EDGE);
-    Texture2DObject::Unbind();
+    // Colour output -------------------------------------------------------------------------------
+    m_outputTexture = allocateStorageTexture();
+
+    // Auxiliary transmittance/depth output --------------------------------------------------------
+    m_dataTexture = allocateStorageTexture();
+
+    // Cloud normal output ------------------------------------------------------------------------
+    m_normalsTexture = allocateStorageTexture();
 }
 
 void VolumetricCloudsRenderPass::EnsureNoiseTextureSized(std::shared_ptr<Texture2DObject>& texture,
@@ -527,6 +534,10 @@ void VolumetricCloudsRenderPass::Render()
     if (m_dataTexture)
     {
         m_dataTexture->BindImageTexture(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, TextureObject::InternalFormatRGBA32F);
+    }
+    if (m_normalsTexture)
+    {
+        m_normalsTexture->BindImageTexture(2, 0, GL_FALSE, 0, GL_WRITE_ONLY, TextureObject::InternalFormatRGBA32F);
     }
     {
         const GLuint gx = (viewport.z + 15) /16;

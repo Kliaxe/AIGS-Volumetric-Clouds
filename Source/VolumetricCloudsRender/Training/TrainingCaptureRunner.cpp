@@ -23,6 +23,7 @@
 #include <iostream>
 #include <cmath>
 #include <random>
+#include <chrono>
 
 // --------------------------------------------------------------------------------------------------
 // ctor
@@ -144,7 +145,10 @@ void TrainingCaptureRunner::BeginSession()
 
     m_sampler.SetRandomSeed(m_config.GetRandomSeed());
 
+    // Configure and start background frame writer
     m_frameWriter->SetOutputDirectory(m_config.GetOutputDirectory());
+    m_frameWriter->FlushAndStop(); // Ensure any previous session is fully drained
+    m_frameWriter->StartWorker();
 
     m_completedPairs = 0U;
 
@@ -191,6 +195,9 @@ void TrainingCaptureRunner::EndSession()
 
     m_cameraController.SetEnabled(m_originalCameraControllerState);
 
+    // Drain any pending write tasks before reporting session completion
+    m_frameWriter->FlushAndStop();
+
     m_isSessionInitialized = false;
     m_isActive = false;
 
@@ -205,6 +212,12 @@ void TrainingCaptureRunner::EndSession()
 // --------------------------------------------------------------------------------------------------
 void TrainingCaptureRunner::CaptureNextPair()
 {
+    // --------------------------------------------------------------------------------------------------
+    // Timing scope (per pair)
+    // --------------------------------------------------------------------------------------------------
+    using Clock = std::chrono::steady_clock;
+    const auto pairStartTime = Clock::now();
+
     const TrainingCameraSampler::CameraSample sample = m_sampler.GenerateSample();
     ApplyCameraSample(sample);
 
@@ -231,13 +244,39 @@ void TrainingCaptureRunner::CaptureNextPair()
         std::max(1, static_cast<int>(std::lround(static_cast<float>(fullResolution.x) * lowScale))),
         std::max(1, static_cast<int>(std::lround(static_cast<float>(fullResolution.y) * lowScale))));
 
+    // For training data, ensure that low- and full-resolution renders use the
+    // same jitter setting so that the noise statistics of the pair match. If
+    // the configuration requests different values, we favour the low-resolution
+    // setting and emit a single warning.
+    const bool lowJitterEnabled = m_config.GetLowResolutionJitterEnabled();
+    const bool highJitterEnabled = m_config.GetHighResolutionJitterEnabled();
+    const bool pairJitterEnabled = lowJitterEnabled;
+
+    if (lowJitterEnabled != highJitterEnabled)
+    {
+        static bool s_warnedJitterMismatch = false;
+        if (!s_warnedJitterMismatch)
+        {
+            std::cerr << "[TrainingCaptureRunner] Warning: low/high jitter settings differ "
+                      << "(low=" << (lowJitterEnabled ? "true" : "false")
+                      << ", high=" << (highJitterEnabled ? "true" : "false")
+                      << "). Using low-resolution setting for both captures to keep "
+                      << "training pairs statistically consistent." << std::endl;
+            s_warnedJitterMismatch = true;
+        }
+    }
+
+    const auto lowCaptureStartTime = Clock::now();
     TrainingFrameWriter::FrameCapture lowFrame = CaptureResolution(lowResolution,
                                                                    m_config.GetLowResolutionMaxStepCount(),
-                                                                   m_config.GetLowResolutionJitterEnabled());
+                                                                   pairJitterEnabled);
+    const auto lowCaptureEndTime = Clock::now();
 
+    const auto fullCaptureStartTime = Clock::now();
     TrainingFrameWriter::FrameCapture highFrame = CaptureResolution(fullResolution,
                                                                     m_config.GetFullResolutionMaxStepCount(),
-                                                                    m_config.GetHighResolutionJitterEnabled());
+                                                                    pairJitterEnabled);
+    const auto fullCaptureEndTime = Clock::now();
 
     TrainingFrameWriter::CaptureMetadata metadata{};
 
@@ -253,20 +292,31 @@ void TrainingCaptureRunner::CaptureNextPair()
         }
     }
 
-    const bool writeSucceeded = m_frameWriter->WritePair(m_completedPairs,
-                                                         lowFrame,
-                                                         highFrame,
-                                                         metadata);
+    const std::uint32_t pairIndex = m_completedPairs;
 
-    if (writeSucceeded)
-    {
-        ++m_completedPairs;
-    }
-    else
-    {
-        std::cerr << "[TrainingCaptureRunner] Failed to write capture pair "
-                  << m_completedPairs << std::endl;
-    }
+    const auto writeStartTime = Clock::now();
+    m_frameWriter->EnqueuePair(pairIndex,
+                               lowFrame,
+                               highFrame,
+                               metadata);
+    const auto writeEndTime = Clock::now();
+
+    const auto pairEndTime = writeEndTime;
+
+    const auto lowCaptureDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(lowCaptureEndTime - lowCaptureStartTime).count();
+    const auto fullCaptureDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(fullCaptureEndTime - fullCaptureStartTime).count();
+    const auto writeDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(writeEndTime - writeStartTime).count();
+    const auto totalPairDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(pairEndTime - pairStartTime).count();
+
+    std::cout << "[TrainingCaptureRunner] Pair " << pairIndex
+              << " timings: lowCapture=" << lowCaptureDurationMs << " ms, "
+              << "fullCapture=" << fullCaptureDurationMs << " ms, "
+              << "writePair=" << writeDurationMs << " ms, "
+              << "total=" << totalPairDurationMs << " ms"
+              << std::endl;
+
+    // Count this pair as captured. Disk writes are now handled by the background worker.
+    ++m_completedPairs;
 
     // Restore application-driven time after capture
     m_cloudsPass.SetTime(m_owner.GetCurrentTime());
@@ -304,6 +354,25 @@ TrainingFrameWriter::FrameCapture TrainingCaptureRunner::CaptureResolution(const
 
     const std::size_t totalPixels = static_cast<std::size_t>(resolution.x) * resolution.y;
 
+    auto readbackTexture = [totalPixels](const std::shared_ptr<Texture2DObject>& texture, std::vector<float>& destination)
+    {
+        if (!texture)
+        {
+            destination.clear();
+            return;
+        }
+
+        destination.resize(totalPixels * 4U);
+
+        TextureObject::SetActiveTexture(0);
+        texture->Bind();
+        texture->GetTextureData(0,
+                                TextureObject::FormatRGBA,
+                                Data::Type::Float,
+                                destination.data());
+        Texture2DObject::Unbind();
+    };
+
     // ----------------------------------------------------------------------------------------------
     // Read back colour buffer
     // ----------------------------------------------------------------------------------------------
@@ -317,22 +386,10 @@ TrainingFrameWriter::FrameCapture TrainingCaptureRunner::CaptureResolution(const
                                   capture.rgbaColorPixels.data());
 
     // ----------------------------------------------------------------------------------------------
-    // Read back auxiliary data buffer (if available)
+    // Read back auxiliary buffers (if available)
     // ----------------------------------------------------------------------------------------------
-    const std::shared_ptr<Texture2DObject> dataTexture = m_cloudsPass.GetDataTexture();
-
-    if (dataTexture)
-    {
-        capture.rgbaDataPixels.resize(totalPixels * 4U);
-
-        TextureObject::SetActiveTexture(0);
-        dataTexture->Bind();
-        dataTexture->GetTextureData(0,
-                                    TextureObject::FormatRGBA,
-                                    Data::Type::Float,
-                                    capture.rgbaDataPixels.data());
-        Texture2DObject::Unbind();
-    }
+    readbackTexture(m_cloudsPass.GetDataTexture(), capture.rgbaDataPixels);
+    readbackTexture(m_cloudsPass.GetNormalsTexture(), capture.rgbaNormalPixels);
     Texture2DObject::Unbind();
 
     return capture;

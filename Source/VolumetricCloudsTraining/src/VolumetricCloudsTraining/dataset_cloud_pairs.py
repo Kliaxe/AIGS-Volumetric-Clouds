@@ -30,11 +30,87 @@ class CloudPairDatasetConfig:
     use_view_transmittance: bool = True
     use_light_transmittance: bool = True
     use_linear_depth: bool = True
+    # Optional RGB normal channels extracted from *_low_normals.pfm. When enabled,
+    # these are concatenated after any scalar auxiliary channels.
+    use_normals: bool = False
 
     # Depth normalization scale in world units. The raw linear depth stored in the PFM
     # (blue channel of the data image) is divided by this value and clamped to [0, 1]
     # before being fed to the network.
     depth_normalization_max: float = 40000.0
+
+
+def compute_dataset_index_splits(
+    num_samples: int,
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
+    split_seed: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Deterministic split of [0, num_samples) into train/val/test indices.
+
+    The split is controlled by explicit fractions and a seed so that
+    training and inference can reproduce the exact same partition of
+    the underlying dataset without duplicating files on disk.
+    """
+    if num_samples <= 0:
+        return [], [], []
+
+    if train_fraction < 0.0 or val_fraction < 0.0 or test_fraction < 0.0:
+        raise ValueError("train_fraction, val_fraction and test_fraction must be non‑negative.")
+
+    total_fraction = train_fraction + val_fraction + test_fraction
+    if total_fraction <= 0.0:
+        raise ValueError("At least one of train_fraction, val_fraction or test_fraction must be > 0.")
+
+    # Normalise fractions if they do not sum exactly to 1.0. This makes the
+    # behaviour robust to small user errors while preserving relative ratios.
+    train_f = train_fraction / total_fraction
+    val_f = val_fraction / total_fraction
+    test_f = test_fraction / total_fraction
+
+    # Derive counts. We compute val/test directly and assign the remaining
+    # samples to train so that all samples are used.
+    val_count = int(num_samples * val_f)
+    test_count = int(num_samples * test_f)
+    train_count = max(0, num_samples - val_count - test_count)
+
+    # Guard against degenerate cases where rounding leads to zero‑sized splits
+    # even though the corresponding fraction is non‑zero.
+    if train_count == 0 and train_f > 0.0:
+        train_count = 1
+    if val_count == 0 and val_f > 0.0 and num_samples - train_count > 1:
+        val_count = 1
+    if test_count == 0 and test_f > 0.0 and num_samples - train_count - val_count > 0:
+        test_count = 1
+
+    # Final safety clamp to ensure counts sum to num_samples.
+    overflow = (train_count + val_count + test_count) - num_samples
+    if overflow > 0:
+        # Prefer to reduce test, then val, leaving train as large as possible.
+        reduce_test = min(overflow, test_count)
+        test_count -= reduce_test
+        overflow -= reduce_test
+        if overflow > 0:
+            reduce_val = min(overflow, val_count)
+            val_count -= reduce_val
+            overflow -= reduce_val
+        if overflow > 0:
+            train_count = max(0, train_count - overflow)
+
+    rng = np.random.default_rng(split_seed)
+    all_indices = np.arange(num_samples)
+    rng.shuffle(all_indices)
+
+    train_end = train_count
+    val_end = train_end + val_count
+
+    train_indices = all_indices[:train_end].tolist()
+    val_indices = all_indices[train_end:val_end].tolist()
+    test_indices = all_indices[val_end:].tolist()
+
+    return train_indices, val_indices, test_indices
 
 
 class CloudPairDataset(Dataset):
@@ -144,6 +220,31 @@ class CloudPairDataset(Dataset):
             depth_np = depth_np / float(self._config.depth_normalization_max)
         depth_np = np.clip(depth_np, 0.0, 1.0)
 
+        # Optional normals image at low resolution ------------------------------------------------
+        # Layout in the renderer:
+        #   RGB: world-space unit normal components (each in approximately [-1, 1]).
+        low_normals_path = low_path.replace("_low.pfm", "_low_normals.pfm")
+        low_normals_np: Optional[np.ndarray]
+        if self._config.use_normals:
+            if os.path.isfile(low_normals_path):
+                low_normals_np = read_pfm(low_normals_path)
+            else:
+                # Fall back to a zero normal field if normals are requested but missing.
+                h_low, w_low, _ = low_np.shape
+                low_normals_np = np.zeros((h_low, w_low, 3), dtype=np.float32)
+        else:
+            low_normals_np = None
+
+        if low_normals_np is not None:
+            if low_normals_np.ndim == 2:
+                low_normals_np = np.repeat(low_normals_np[..., None], 3, axis=2)
+            if low_normals_np.shape[2] < 3:
+                pad = 3 - low_normals_np.shape[2]
+                pad_values = np.zeros((low_normals_np.shape[0], low_normals_np.shape[1], pad), dtype=np.float32)
+                low_normals_np = np.concatenate([low_normals_np, pad_values], axis=2)
+            # Clamp to a reasonable signed range; we deliberately keep the sign.
+            low_normals_np = np.clip(low_normals_np, -1.0, 1.0)
+
         # To torch (C, H, W)
         # Convert HWC (NumPy) -> CHW (PyTorch). Channel-first is the standard for torch layers.
         # permute(2,0,1): move channels axis from last to first. contiguous(): ensure memory layout is contiguous.
@@ -152,6 +253,11 @@ class CloudPairDataset(Dataset):
         t_view = torch.from_numpy(t_view_np).permute(2, 0, 1).contiguous()   # [1, h, w]
         t_light = torch.from_numpy(t_light_np).permute(2, 0, 1).contiguous() # [1, h, w]
         depth = torch.from_numpy(depth_np).permute(2, 0, 1).contiguous()     # [1, h, w]
+        normals: Optional[torch.Tensor]
+        if low_normals_np is not None:
+            normals = torch.from_numpy(low_normals_np).permute(2, 0, 1).contiguous()  # [3, h, w]
+        else:
+            normals = None
 
         # Upsample low to high resolution using chosen interpolation
         _, target_h, target_w = high.shape
@@ -182,6 +288,16 @@ class CloudPairDataset(Dataset):
             low_up = torch.cat([low_up_rgb, aux_up], dim=0)
         else:
             low_up = low_up_rgb
+
+        # Optionally upsample normals and append them after the scalar auxiliary channels.
+        if normals is not None:
+            normals_up = F.interpolate(
+                normals.unsqueeze(0),
+                size=(target_h, target_w),
+                mode=self._config.upsample_mode,
+                align_corners=self._config.align_corners if self._config.upsample_mode in ("bilinear", "bicubic") else None,
+            ).squeeze(0)
+            low_up = torch.cat([low_up, normals_up], dim=0)
 
         # Why cropping?
         # - Data augmentation: exposes the model to diverse local patterns, reducing overfitting.

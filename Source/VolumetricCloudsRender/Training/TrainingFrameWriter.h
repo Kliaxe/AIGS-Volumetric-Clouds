@@ -3,6 +3,10 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <deque>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <glm/vec3.hpp>
 #include <glm/vec2.hpp>
 #include <glm/mat4x4.hpp>
@@ -46,6 +50,14 @@ public:
         //  so that downstream tools can treat colour and data streams independently.
         // ----------------------------------------------------------------------------------------------
         std::vector<float> rgbaDataPixels;
+
+        // ----------------------------------------------------------------------------------------------
+        // Cloud normal buffer
+        // ----------------------------------------------------------------------------------------------
+        //  Optional RGBA buffer containing world-space cloud normals in RGB and a constant 1.0 alpha.
+        //  Persisted as an additional PFM so the training pipeline can access both low/high versions.
+        // ----------------------------------------------------------------------------------------------
+        std::vector<float> rgbaNormalPixels;
     };
 
     struct CaptureMetadata
@@ -60,10 +72,20 @@ public:
 public:
 
     TrainingFrameWriter();
+    ~TrainingFrameWriter();
 
     void SetOutputDirectory(const std::filesystem::path& directory);
     const std::filesystem::path& GetOutputDirectory() const;
 
+    // Asynchronous pair write API (producer side)
+    void StartWorker();
+    void EnqueuePair(std::uint32_t pairIndex,
+                     const FrameCapture& lowResolutionFrame,
+                     const FrameCapture& fullResolutionFrame,
+                     const CaptureMetadata& metadata);
+    void FlushAndStop();
+
+    // Synchronous pair write API (used by the worker thread; remains available for direct use)
     bool WritePair(std::uint32_t pairIndex,
                    const FrameCapture& lowResolutionFrame,
                    const FrameCapture& fullResolutionFrame,
@@ -82,9 +104,27 @@ private:
     std::filesystem::path BuildFramePath(std::uint32_t pairIndex, const std::string& label, const std::string& extension) const;
     std::filesystem::path BuildMetadataPath(std::uint32_t pairIndex) const;
 
+    // Background worker loop
+    void WorkerMain();
+
 private:
 
+    struct QueuedPair
+    {
+        std::uint32_t pairIndex;
+        FrameCapture lowResolutionFrame;
+        FrameCapture fullResolutionFrame;
+        CaptureMetadata metadata;
+    };
+
     std::filesystem::path m_outputDirectory;
+
+    std::thread m_workerThread;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCondition;
+    std::deque<QueuedPair> m_queue;
+    bool m_workerRunning{ false };
+    bool m_stopRequested{ false };
 };
 
 

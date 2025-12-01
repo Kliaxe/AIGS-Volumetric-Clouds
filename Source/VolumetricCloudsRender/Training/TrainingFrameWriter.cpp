@@ -13,6 +13,12 @@ TrainingFrameWriter::TrainingFrameWriter()
 {
 }
 
+TrainingFrameWriter::~TrainingFrameWriter()
+{
+    // Ensure the background worker is stopped and the queue is drained
+    FlushAndStop();
+}
+
 // --------------------------------------------------------------------------------------------------
 // Directory management
 // --------------------------------------------------------------------------------------------------
@@ -24,6 +30,65 @@ void TrainingFrameWriter::SetOutputDirectory(const std::filesystem::path& direct
 const std::filesystem::path& TrainingFrameWriter::GetOutputDirectory() const
 {
     return m_outputDirectory;
+}
+
+// --------------------------------------------------------------------------------------------------
+// Asynchronous pair write control
+// --------------------------------------------------------------------------------------------------
+void TrainingFrameWriter::StartWorker()
+{
+    if (m_workerRunning)
+    {
+        return;
+    }
+
+    m_stopRequested = false;
+    m_workerRunning = true;
+
+    // Launch background worker thread
+    m_workerThread = std::thread(&TrainingFrameWriter::WorkerMain, this);
+}
+
+void TrainingFrameWriter::EnqueuePair(std::uint32_t pairIndex,
+                                      const FrameCapture& lowResolutionFrame,
+                                      const FrameCapture& fullResolutionFrame,
+                                      const CaptureMetadata& metadata)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+
+        QueuedPair workItem{};
+        workItem.pairIndex = pairIndex;
+        workItem.lowResolutionFrame = lowResolutionFrame;
+        workItem.fullResolutionFrame = fullResolutionFrame;
+        workItem.metadata = metadata;
+
+        m_queue.push_back(std::move(workItem));
+    }
+
+    m_queueCondition.notify_one();
+}
+
+void TrainingFrameWriter::FlushAndStop()
+{
+    if (!m_workerRunning)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_stopRequested = true;
+    }
+
+    m_queueCondition.notify_all();
+
+    if (m_workerThread.joinable())
+    {
+        m_workerThread.join();
+    }
+
+    m_workerRunning = false;
 }
 
 bool TrainingFrameWriter::EnsureOutputDirectory()
@@ -63,10 +128,12 @@ bool TrainingFrameWriter::WritePair(std::uint32_t pairIndex,
     // previously written consumers which expect only "low/high" PFM files continue to work.
     // The auxiliary data images use explicit labels to make their intent clear.
     // ----------------------------------------------------------------------------------------------
-    const std::filesystem::path lowColorPath  = BuildFramePath(pairIndex, "low", ".pfm");
-    const std::filesystem::path highColorPath = BuildFramePath(pairIndex, "high", ".pfm");
-    const std::filesystem::path lowDataPath   = BuildFramePath(pairIndex, "low_data", ".pfm");
-    const std::filesystem::path highDataPath  = BuildFramePath(pairIndex, "high_data", ".pfm");
+    const std::filesystem::path lowColorPath    = BuildFramePath(pairIndex, "low", ".pfm");
+    const std::filesystem::path highColorPath   = BuildFramePath(pairIndex, "high", ".pfm");
+    const std::filesystem::path lowDataPath     = BuildFramePath(pairIndex, "low_data", ".pfm");
+    const std::filesystem::path highDataPath    = BuildFramePath(pairIndex, "high_data", ".pfm");
+    const std::filesystem::path lowNormalPath   = BuildFramePath(pairIndex, "low_normals", ".pfm");
+    const std::filesystem::path highNormalPath  = BuildFramePath(pairIndex, "high_normals", ".pfm");
     const std::filesystem::path metadataPath = BuildMetadataPath(pairIndex);
 
     bool success = true;
@@ -90,6 +157,21 @@ bool TrainingFrameWriter::WritePair(std::uint32_t pairIndex,
         success &= WriteFramePixels(highDataPath,
                                     fullResolutionFrame.resolution,
                                     fullResolutionFrame.rgbaDataPixels);
+    }
+
+    // Normal images -------------------------------------------------------------------------------
+    if (!lowResolutionFrame.rgbaNormalPixels.empty())
+    {
+        success &= WriteFramePixels(lowNormalPath,
+                                    lowResolutionFrame.resolution,
+                                    lowResolutionFrame.rgbaNormalPixels);
+    }
+
+    if (!fullResolutionFrame.rgbaNormalPixels.empty())
+    {
+        success &= WriteFramePixels(highNormalPath,
+                                    fullResolutionFrame.resolution,
+                                    fullResolutionFrame.rgbaNormalPixels);
     }
     success &= WriteMetadata(metadataPath, pairIndex, metadata);
 
@@ -123,35 +205,79 @@ bool TrainingFrameWriter::WriteFramePixels(const std::filesystem::path& filePath
     fileStream << "-1.0\n";
 
     const std::size_t channelCount = 4U;
+    const int width = resolution.x;
+    const int height = resolution.y;
 
-    if (pixels.size() < static_cast<std::size_t>(resolution.x) * static_cast<std::size_t>(resolution.y) * channelCount)
+    if (pixels.size() < static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * channelCount)
     {
         std::cerr << "[TrainingFrameWriter] Pixel buffer too small for frame: "
                   << filePath << std::endl;
         return false;
     }
 
-    for (int y = 0; y < resolution.y; ++y)
-    {
-        const std::size_t rowOffset = static_cast<std::size_t>(y) * resolution.x * channelCount;
+    // Buffer a single RGB row to minimise the number of write() calls
+    std::vector<float> rowBuffer(static_cast<std::size_t>(width) * 3U);
 
-        for (int x = 0; x < resolution.x; ++x)
+    for (int y = 0; y < height; ++y)
+    {
+        const std::size_t rowOffset = static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * channelCount;
+
+        for (int x = 0; x < width; ++x)
         {
             const std::size_t pixelOffset = rowOffset + static_cast<std::size_t>(x) * channelCount;
+            const std::size_t rgbOffset = static_cast<std::size_t>(x) * 3U;
 
-            const float r = pixels[pixelOffset + 0U];
-            const float g = pixels[pixelOffset + 1U];
-            const float b = pixels[pixelOffset + 2U];
-
-            fileStream.write(reinterpret_cast<const char*>(&r), sizeof(float));
-            fileStream.write(reinterpret_cast<const char*>(&g), sizeof(float));
-            fileStream.write(reinterpret_cast<const char*>(&b), sizeof(float));
+            rowBuffer[rgbOffset + 0U] = pixels[pixelOffset + 0U]; // R
+            rowBuffer[rgbOffset + 1U] = pixels[pixelOffset + 1U]; // G
+            rowBuffer[rgbOffset + 2U] = pixels[pixelOffset + 2U]; // B
         }
+
+        fileStream.write(reinterpret_cast<const char*>(rowBuffer.data()),
+                         static_cast<std::streamsize>(rowBuffer.size() * sizeof(float)));
     }
 
     fileStream.flush();
 
     return fileStream.good();
+}
+
+// --------------------------------------------------------------------------------------------------
+// Background worker loop
+// --------------------------------------------------------------------------------------------------
+void TrainingFrameWriter::WorkerMain()
+{
+    for (;;)
+    {
+        QueuedPair workItem{};
+
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+
+            m_queueCondition.wait(lock, [this]()
+            {
+                return m_stopRequested || !m_queue.empty();
+            });
+
+            if (m_stopRequested && m_queue.empty())
+            {
+                break;
+            }
+
+            workItem = std::move(m_queue.front());
+            m_queue.pop_front();
+        }
+
+        const bool writeSucceeded = WritePair(workItem.pairIndex,
+                                              workItem.lowResolutionFrame,
+                                              workItem.fullResolutionFrame,
+                                              workItem.metadata);
+
+        if (!writeSucceeded)
+        {
+            std::cerr << "[TrainingFrameWriter] Failed to write capture pair "
+                      << workItem.pairIndex << std::endl;
+        }
+    }
 }
 
 // --------------------------------------------------------------------------------------------------
