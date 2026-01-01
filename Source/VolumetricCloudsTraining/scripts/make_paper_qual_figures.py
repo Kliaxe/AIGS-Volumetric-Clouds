@@ -645,7 +645,7 @@ def _plot_prediction_grid(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to a training config YAML (exp1/exp2).")
-    parser.add_argument("--run_name", type=str, required=True, help="Outputs/<run_name>/... folder name (e.g. exp1_buffers_general).")
+    parser.add_argument("--run_name", type=str, required=True, help="outputs/<run_name>/... folder name (e.g. exp1_buffers_general).")
     parser.add_argument("--test_index", type=int, default=0, help="Local index within the test split (default: 0).")
     parser.add_argument("--epoch", type=int, default=100, help="Checkpoint epoch to visualize (default: 100).")
     parser.add_argument("--output_dir", type=str, default="", help="Directory to write PNGs (default: Report/figures).")
@@ -686,8 +686,8 @@ def main() -> None:
     model_bilinear = bool(infer.get("model_bilinear", True))
     model_learn_residual = bool(infer.get("model_learn_residual", True))
 
-    # Outputs folder: configs store Outputs relative to project root.
-    outputs_root = os.path.join(_project_root(), "Outputs")
+    # Outputs folder: outputs/ is stored at repo root.
+    outputs_root = os.path.join(_repo_root(), "outputs")
 
     # Use the first experiment to load a sample (input/GT). This defines the input RGB and GT.
     # For other experiments the input may include more channels, but the *RGB upsample* is always first.

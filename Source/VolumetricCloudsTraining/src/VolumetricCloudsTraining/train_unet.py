@@ -28,7 +28,7 @@ from .pfm_io import write_pfm
 @dataclass
 class TrainConfig:
     data_dir: str
-    output_dir: str = "Outputs"
+    output_dir: str = "outputs"
     epochs: int = 1
     batch_size: int = 2
     learning_rate: float = 1e-4

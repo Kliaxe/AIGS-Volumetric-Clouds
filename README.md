@@ -83,7 +83,7 @@ Available configurations:
 - `config_exp2_data_efficiency_general.yaml` - Data efficiency experiments (general views)
 - `config.yaml` - Default configuration
 
-**Training outputs** are saved to `Outputs/<experiment_name>/`:
+**Training outputs** are saved to `outputs/<experiment_name>/`:
 - `checkpoints/` - Model weights saved per epoch (`.pt` files)
 - `logs/` - Training logs including:
   - `loss_curve.txt` - Per-step and per-epoch loss values
@@ -93,7 +93,7 @@ Available configurations:
 
 For multi-experiment configs, outputs are organized as:
 ```
-Outputs/<experiment_name>/experiments/
+outputs/<experiment_name>/experiments/
 ├── experiment_1/
 │   ├── checkpoints/
 │   └── logs/
@@ -146,7 +146,7 @@ The project includes a few utility scripts used for report generation:
 │       │       ├── dataset_cloud_pairs.py  # Dataset loader
 │       │       └── models/
 │       │           └── unet.py     # U-Net architecture
-│       └── Outputs/                # Training outputs (generated)
+│       └── outputs/                # Training outputs (generated)
 └── Report/                         # LaTeX report
 ```
 

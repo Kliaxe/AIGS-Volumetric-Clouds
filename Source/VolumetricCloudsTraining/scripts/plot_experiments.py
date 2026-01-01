@@ -52,7 +52,7 @@ def _moving_average(values: List[float], window: int = 5) -> List[float]:
     return smoothed
 
 
-def plot_exp0_overfit(outputs_root: str = "Outputs") -> None:
+def plot_exp0_overfit(outputs_root: str = "outputs") -> None:
     """Plot loss and SSIM curves for Experiment 0 (single-view overfitting)."""
     family = "exp0_overfit_singleview"
     experiments = {
@@ -129,7 +129,7 @@ def plot_exp0_overfit(outputs_root: str = "Outputs") -> None:
     _save_figure(fig_ssim, "exp0_overfit_ssim")
 
 
-def plot_exp1_buffers(outputs_root: str = "Outputs") -> None:
+def plot_exp1_buffers(outputs_root: str = "outputs") -> None:
     """Plot buffer ablation SSIM curves for Experiment 1."""
     # General-view: RGB vs richest configuration
     family_general = "exp1_buffers_general"
@@ -263,7 +263,7 @@ def _collect_best_ssim_for_sizes(
     return best_rgb, best_rich
 
 
-def plot_exp2_data_efficiency(outputs_root: str = "Outputs") -> None:
+def plot_exp2_data_efficiency(outputs_root: str = "outputs") -> None:
     """Plot data efficiency curves for Experiment 2."""
     # General-view: SSIM vs epoch for selected configs, and best-SSIM vs size.
     family_general = "exp2_data_efficiency_general"
@@ -412,7 +412,7 @@ def plot_exp2_data_efficiency(outputs_root: str = "Outputs") -> None:
     _save_figure(fig_s_size, "exp2_single_best_ssim_vs_size")
 
 
-def plot_all(outputs_root: str = "Outputs") -> None:
+def plot_all(outputs_root: str = "outputs") -> None:
     """Generate all publication-style plots for the current experiments."""
     plot_exp0_overfit(outputs_root=outputs_root)
     plot_exp1_buffers(outputs_root=outputs_root)
@@ -424,5 +424,5 @@ if __name__ == "__main__":
     #   uv run python scripts/plot_experiments.py
     # or:
     #   python scripts/plot_experiments.py
-    plot_all(outputs_root="Outputs")
+    plot_all(outputs_root="outputs")
 

@@ -37,7 +37,7 @@ train:
   <<: [*common_model, *common_split, *common_aux]
 
   data_dir: TrainingCaptures_Single  # Single-view dataset root.
-  output_dir: Outputs                # Base output directory.
+  output_dir: outputs                # Base output directory (repo-root).
 
   # Training schedule ---------------------------------------------------------
   epochs: 100            # Default training length.
@@ -60,7 +60,7 @@ train:
 
 infer:
   # Model checkpoint to use for inference (can be updated as needed).
-  checkpoint: Outputs/checkpoints/unet_epoch_100.pt
+  checkpoint: outputs/checkpoints/unet_epoch_100.pt
 
   # Model configuration ---------------------------------------------------------
   <<: [*common_model, *common_split, *common_aux]
@@ -73,7 +73,7 @@ infer:
   recursive: false
 
   # Output directory and naming -------------------------------------------------
-  output_dir: Outputs/infer
+  output_dir: outputs/infer
   output_suffix: "_pred"
 
   # Runtime behaviour -----------------------------------------------------------

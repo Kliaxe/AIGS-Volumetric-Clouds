@@ -28,7 +28,7 @@ train:
   <<: [*common_model, *common_split, *common_aux]
 
   data_dir: TrainingCaptures_Single  # Single-view dataset root.
-  output_dir: Outputs                # Base output directory.
+  output_dir: outputs                # Base output directory (repo-root).
 
   # Training schedule ---------------------------------------------------------
   epochs: 200          # Allow enough epochs to strongly overfit tiny datasets.
@@ -63,7 +63,7 @@ train:
 
 infer:
   # Model checkpoint to use for inference (can be updated as needed).
-  checkpoint: Outputs/checkpoints/unet_epoch_200.pt
+  checkpoint: outputs/checkpoints/unet_epoch_200.pt
 
   # Model configuration ---------------------------------------------------------
   <<: [*common_model, *common_split, *common_aux]
@@ -76,12 +76,12 @@ infer:
   recursive: false                    # Non-recursive search.
 
   # Output directory and naming -------------------------------------------------
-  output_dir: Outputs/infer
+  output_dir: outputs/infer
   output_suffix: "_pred"
 
   # Optional experiment-aware inference ---------------------------------------
   experiment_name: overfit_pairs_1    # Default experiment label for inference.
-  checkpoint_dir: Outputs/exp0_overfit_singleview/experiments/overfit_pairs_1/checkpoints
+  checkpoint_dir: outputs/exp0_overfit_singleview/experiments/overfit_pairs_1/checkpoints
   checkpoint_glob: "unet_epoch_*.pt"
   run_all_checkpoints: true
   run_all_experiments: false

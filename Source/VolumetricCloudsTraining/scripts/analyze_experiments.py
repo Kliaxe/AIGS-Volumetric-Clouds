@@ -183,7 +183,7 @@ def _summarize_experiment(family: str, name: str, loss_txt_path: str, ssim_txt_p
 
 
 def _find_experiments(outputs_root: str) -> List[ExperimentMetrics]:
-    """Walk Outputs/*/experiments/*/logs and collect summaries."""
+    """Walk outputs/*/experiments/*/logs and collect summaries."""
     all_metrics: List[ExperimentMetrics] = []
 
     if not os.path.isdir(outputs_root):
@@ -234,8 +234,8 @@ def _format_float(value: float, decimals: int = 6) -> str:
     return fmt.format(value)
 
 
-def print_summary(outputs_root: str = "Outputs") -> None:
-    """Print a human-readable summary of all experiments under Outputs/.
+def print_summary(outputs_root: str = "outputs") -> None:
+    """Print a human-readable summary of all experiments under outputs/.
 
     For each experiment, we show:
       - Number of epochs
