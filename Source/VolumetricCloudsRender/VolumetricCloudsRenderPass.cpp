@@ -154,6 +154,12 @@ VolumetricCloudsRenderPass::VolumetricCloudsRenderPass(std::shared_ptr<Material>
         m_ambientLuminanceLocation = m_computeProgram.GetUniformLocation("uAmbientLuminance");
         m_maxStepCountLocation = m_computeProgram.GetUniformLocation("uMaxStepCount");
         m_jitterEnabledLocation = m_computeProgram.GetUniformLocation("uJitterEnabled");
+        m_extinctionCoefficientMultiplierLocation = m_computeProgram.GetUniformLocation("uExtinctionCoefficientMultiplier");
+        m_totalNoiseScaleLocation = m_computeProgram.GetUniformLocation("uTotalNoiseScale");
+        m_coverageAmountLocation = m_computeProgram.GetUniformLocation("uCoverageAmount");
+        m_coverageMinimumLocation = m_computeProgram.GetUniformLocation("uCoverageMinimum");
+        m_typeAmountLocation = m_computeProgram.GetUniformLocation("uTypeAmount");
+        m_typeMinimumLocation = m_computeProgram.GetUniformLocation("uTypeMinimum");
     }
     else
     {
@@ -213,6 +219,67 @@ void VolumetricCloudsRenderPass::SetAmbientLuminance(const glm::vec3& luminance)
 const glm::vec3& VolumetricCloudsRenderPass::GetAmbientLuminance() const
 {
     return m_ambientLuminance;
+}
+
+void VolumetricCloudsRenderPass::SetExtinctionCoefficientMultiplier(float multiplier)
+{
+    m_extinctionCoefficientMultiplier = std::max(multiplier, 0.0f);
+}
+
+float VolumetricCloudsRenderPass::GetExtinctionCoefficientMultiplier() const
+{
+    return m_extinctionCoefficientMultiplier;
+}
+
+void VolumetricCloudsRenderPass::SetTotalNoiseScale(float scale)
+{
+    m_totalNoiseScale = std::max(scale, 0.0f);
+}
+
+float VolumetricCloudsRenderPass::GetTotalNoiseScale() const
+{
+    return m_totalNoiseScale;
+}
+
+void VolumetricCloudsRenderPass::SetCoverageAmount(float amount)
+{
+    m_coverageAmount = std::max(amount, 0.0f);
+}
+
+float VolumetricCloudsRenderPass::GetCoverageAmount() const
+{
+    return m_coverageAmount;
+}
+
+void VolumetricCloudsRenderPass::SetCoverageMinimum(float minimum)
+{
+    // Coverage minimum is used as a lower clamp; keep it inside [0, 1].
+    m_coverageMinimum = glm::clamp(minimum, 0.0f, 1.0f);
+}
+
+float VolumetricCloudsRenderPass::GetCoverageMinimum() const
+{
+    return m_coverageMinimum;
+}
+
+void VolumetricCloudsRenderPass::SetTypeAmount(float amount)
+{
+    m_typeAmount = std::max(amount, 0.0f);
+}
+
+float VolumetricCloudsRenderPass::GetTypeAmount() const
+{
+    return m_typeAmount;
+}
+
+void VolumetricCloudsRenderPass::SetTypeMinimum(float minimum)
+{
+    m_typeMinimum = glm::clamp(minimum, 0.0f, 1.0f);
+}
+
+float VolumetricCloudsRenderPass::GetTypeMinimum() const
+{
+    return m_typeMinimum;
 }
 
 void VolumetricCloudsRenderPass::SetJitterEnabled(bool enabled)
@@ -507,6 +574,18 @@ void VolumetricCloudsRenderPass::Render()
     if (m_sunIlluminanceLocation >= 0) m_computeProgram.SetUniform(m_sunIlluminanceLocation, m_sunIlluminance);
 
     if (m_ambientLuminanceLocation >= 0) m_computeProgram.SetUniform(m_ambientLuminanceLocation, m_ambientLuminance);
+
+    if (m_extinctionCoefficientMultiplierLocation >= 0) m_computeProgram.SetUniform(m_extinctionCoefficientMultiplierLocation, m_extinctionCoefficientMultiplier);
+
+    if (m_totalNoiseScaleLocation >= 0) m_computeProgram.SetUniform(m_totalNoiseScaleLocation, m_totalNoiseScale);
+
+    if (m_coverageAmountLocation >= 0) m_computeProgram.SetUniform(m_coverageAmountLocation, m_coverageAmount);
+
+    if (m_coverageMinimumLocation >= 0) m_computeProgram.SetUniform(m_coverageMinimumLocation, m_coverageMinimum);
+
+    if (m_typeAmountLocation >= 0) m_computeProgram.SetUniform(m_typeAmountLocation, m_typeAmount);
+
+    if (m_typeMinimumLocation >= 0) m_computeProgram.SetUniform(m_typeMinimumLocation, m_typeMinimum);
 
     if (m_maxStepCountLocation >= 0) m_computeProgram.SetUniform(m_maxStepCountLocation, m_maxStepCount);
 

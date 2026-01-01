@@ -70,20 +70,32 @@ def compute_dataset_index_splits(
     val_f = val_fraction / total_fraction
     test_f = test_fraction / total_fraction
 
-    # Derive counts. We compute val/test directly and assign the remaining
-    # samples to train so that all samples are used.
-    val_count = int(num_samples * val_f)
-    test_count = int(num_samples * test_f)
+    # Derive initial counts (floor). We compute val/test directly and assign
+    # the remaining samples to train so that all samples are used.
+    val_count = int(num_samples * val_f)   # floor
+    test_count = int(num_samples * test_f) # floor
     train_count = max(0, num_samples - val_count - test_count)
 
-    # Guard against degenerate cases where rounding leads to zero‑sized splits
-    # even though the corresponding fraction is non‑zero.
+    # Guard against degenerate cases where rounding yields zero‑sized splits
+    # even though the fraction is non‑zero. We steal samples from the train
+    # split (when available) to ensure val/test exist for small datasets.
+    #
+    # Note:
+    # - For num_samples == 1, we cannot have a validation set while also
+    #   training, so val/test may remain empty (expected for overfit sanity).
     if train_count == 0 and train_f > 0.0:
+        # Ensure at least one training sample when training is requested.
         train_count = 1
-    if val_count == 0 and val_f > 0.0 and num_samples - train_count > 1:
+
+    if val_count == 0 and val_f > 0.0 and train_count > 1:
+        # Ensure at least one validation sample when requested and feasible.
         val_count = 1
-    if test_count == 0 and test_f > 0.0 and num_samples - train_count - val_count > 0:
+        train_count -= 1
+
+    if test_count == 0 and test_f > 0.0 and train_count > 1:
+        # Ensure at least one test sample when requested and feasible.
         test_count = 1
+        train_count -= 1
 
     # Final safety clamp to ensure counts sum to num_samples.
     overflow = (train_count + val_count + test_count) - num_samples

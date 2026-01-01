@@ -7,8 +7,10 @@
 Binaries
 Intermediate
 imgui.ini
-TrainingCaptures
+TrainingCaptures*
 Output
+Outputs
+Report
 
 # User-specific files
 *.rsuser

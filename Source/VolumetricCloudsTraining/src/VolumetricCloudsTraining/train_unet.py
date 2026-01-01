@@ -6,6 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import matplotlib
 
 
@@ -46,6 +47,10 @@ class TrainConfig:
     # epochs as well as at the final epoch. When 0, export occurs only at the
     # final epoch.
     export_every_n_epochs: int = 0
+    # When True, include the dense per-step training loss curve in loss_curve.png.
+    # This is useful for debugging, but can be disabled for "hero" paper figures
+    # to keep plots visually simple.
+    plot_step_loss: bool = False
     # Epoch checkpoint stride: save a checkpoint every N epochs (always saves
     # the final epoch checkpoint regardless of this value).
     save_epoch_stride: int = 1
@@ -182,6 +187,52 @@ def _compute_auxiliary_weights(low_up: torch.Tensor, config: TrainConfig) -> tor
     return weights
 
 
+def _gaussian_window(window_size: int, sigma: float, channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    # Create a 2D Gaussian window for SSIM computation.
+    coords = torch.arange(window_size, device=device, dtype=dtype) - (window_size - 1) * 0.5
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    g = g / g.sum()
+    kernel_1d = g.unsqueeze(0)
+    kernel_2d = (kernel_1d.t() @ kernel_1d).unsqueeze(0).unsqueeze(0)
+    window = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+    return window
+
+
+def _compute_batch_ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    # Compute mean SSIM over a batch of RGB images.
+    # Inputs are expected in [0, 1]; clamp to be safe.
+    pred_clamped = torch.clamp(pred, 0.0, 1.0)
+    target_clamped = torch.clamp(target, 0.0, 1.0)
+
+    b, c, h, w = pred_clamped.shape
+    device = pred_clamped.device
+    dtype = pred_clamped.dtype
+
+    window = _gaussian_window(window_size, sigma, c, device, dtype)
+
+    # Constants from the original SSIM paper for L=1 images.
+    c1 = (0.01 ** 2)
+    c2 = (0.03 ** 2)
+
+    mu_x = F.conv2d(pred_clamped, window, padding=window_size // 2, groups=c)
+    mu_y = F.conv2d(target_clamped, window, padding=window_size // 2, groups=c)
+
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.conv2d(pred_clamped * pred_clamped, window, padding=window_size // 2, groups=c) - mu_x2
+    sigma_y2 = F.conv2d(target_clamped * target_clamped, window, padding=window_size // 2, groups=c) - mu_y2
+    sigma_xy = F.conv2d(pred_clamped * target_clamped, window, padding=window_size // 2, groups=c) - mu_xy
+
+    numerator = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
+
+    ssim_map = numerator / (denominator + 1e-12)
+    ssim_value = ssim_map.mean()
+    return ssim_value
+
+
 def _export_loss_curves(
     step_indices: list[int],
     step_losses: list[float],
@@ -189,6 +240,7 @@ def _export_loss_curves(
     epoch_train_losses: list[float],
     epoch_val_losses: list[float],
     logs_dir: str,
+    plot_step_loss: bool,
 ) -> None:
     """
     Export training loss history both as a PNG plot and as a plain text file.
@@ -207,32 +259,41 @@ def _export_loss_curves(
     epoch_train_np = np.asarray(epoch_train_losses, dtype=np.float64)
     epoch_val_np = np.asarray(epoch_val_losses, dtype=np.float64)
 
-    # Per-step training loss (dense curve)
-    plt.plot(step_indices, step_losses_np, label="Train step loss", color="tab:blue", linewidth=1.25)
+    # Per-step training loss (dense curve) ----------------------------
+    if plot_step_loss:
+        plt.plot(step_indices, step_losses_np, label="Train step loss", color="tab:blue", linewidth=1.25)
 
-    # Per-epoch averages (sparser curves, plotted at the step reached at end of epoch)
+    # Per-epoch smoothed averages for readability --------------------
     if len(epoch_steps) > 0 and len(epoch_train_losses) == len(epoch_steps):
+        # Smoothed train curve (moving average over epochs).
+        window = 5  # window size for epoch smoothing
+        if len(epoch_train_np) >= window:
+            kernel = np.ones(window, dtype=np.float64) / float(window)
+            smooth_train = np.convolve(epoch_train_np, kernel, mode="same")
         plt.plot(
             epoch_steps,
-            epoch_train_np,
-            label="Train epoch avg",
-            color="tab:green",
-            linewidth=1.25,
-            marker="o",
-            markersize=3,
+                smooth_train,
+                label="Train (smooth, 5-epoch)",
+                color="tab:red",
+                linewidth=2.0,
+                alpha=1.0,
         )
 
     if len(epoch_steps) > 0 and len(epoch_val_losses) > 0:
         count = min(len(epoch_steps), len(epoch_val_losses))
         if count > 0:
+            # Smoothed validation curve (moving average over epochs).
+            window = 5
+            if count >= window:
+                kernel = np.ones(window, dtype=np.float64) / float(window)
+                smooth_val = np.convolve(epoch_val_np[:count], kernel, mode="same")
             plt.plot(
                 epoch_steps[:count],
-                epoch_val_np[:count],
-                label="Val epoch avg",
+                    smooth_val,
+                    label="Val (smooth, 5-epoch)",
                 color="tab:orange",
-                linewidth=1.25,
-                marker="s",
-                markersize=3,
+                    linewidth=2.0,
+                    alpha=1.0,
             )
 
     # Use a logarithmic y-axis so that early large losses and late small losses
@@ -276,6 +337,66 @@ def _export_loss_curves(
     print(f"Saved training loss txt:  {txt_path}")
 
 
+def _export_ssim_curve(
+    epoch_val_ssim: list[float],
+    logs_dir: str,
+) -> None:
+    # Export validation SSIM history as a PNG plot and as a plain text file.
+    if len(epoch_val_ssim) == 0:
+        return
+
+    fig = plt.figure(figsize=(8, 4.5), dpi=120)
+
+    epochs = np.arange(1, len(epoch_val_ssim) + 1, dtype=np.int32)
+    ssim_np = np.asarray(epoch_val_ssim, dtype=np.float64)
+
+    # Smoothed validation SSIM (moving average over epochs) for readability.
+    window = 5
+    if len(ssim_np) >= window:
+        kernel = np.ones(window, dtype=np.float64) / float(window)
+        smooth_ssim = np.convolve(ssim_np, kernel, mode="same")
+        plt.plot(
+            epochs,
+            smooth_ssim,
+            label="Val SSIM (smooth, 5-epoch)",
+            color="tab:purple",
+            linewidth=2.0,
+            alpha=1.0,
+        )
+    else:
+        # For very short runs, fall back to plotting the raw values.
+        plt.plot(
+            epochs,
+            ssim_np,
+            label="Val SSIM",
+            color="tab:purple",
+            linewidth=1.5,
+            marker="o",
+            markersize=3,
+        )
+
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("Epoch")
+    plt.ylabel("SSIM")
+    plt.title("Validation SSIM per epoch")
+    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.legend(loc="best")
+    plt.tight_layout()
+
+    png_path = os.path.join(logs_dir, "ssim_curve.png")
+    plt.savefig(png_path)
+    plt.close(fig)
+
+    txt_path = os.path.join(logs_dir, "ssim_curve.txt")
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write("# Per-epoch validation SSIM\n")
+        handle.write("# epoch ssim\n")
+        for idx, value in enumerate(epoch_val_ssim, start=1):
+            handle.write(f"{idx} {value:.6f}\n")
+
+    print(f"Saved validation SSIM plot: {png_path}")
+    print(f"Saved validation SSIM txt:  {txt_path}")
+
 def train_unet(config: TrainConfig) -> None:
     # ----------------- Setup -----------------
     torch.manual_seed(config.seed)
@@ -296,6 +417,7 @@ def train_unet(config: TrainConfig) -> None:
         use_view_transmittance=config.use_view_transmittance,
         use_light_transmittance=config.use_light_transmittance,
         use_linear_depth=config.use_linear_depth,
+        use_normals=config.use_normals,
         depth_normalization_max=config.depth_normalization_max,
     )
     dataset = CloudPairDataset(ds_conf)
@@ -408,6 +530,7 @@ def train_unet(config: TrainConfig) -> None:
     epoch_steps: list[int] = []
     epoch_train_losses: list[float] = []
     epoch_val_losses: list[float] = []
+    epoch_val_ssim: list[float] = []
 
     # Simple ETA tracking between log events
     last_log_step: Optional[int] = None
@@ -513,6 +636,7 @@ def train_unet(config: TrainConfig) -> None:
         if val_loader is not None:
             model.eval()
             val_loss_sum = 0.0
+            val_ssim_sum = 0.0
             with torch.no_grad():
                 for val_batch in val_loader:
                     val_low_up = val_batch["low_up"].to(device, non_blocking=True)
@@ -529,9 +653,23 @@ def train_unet(config: TrainConfig) -> None:
 
                     val_loss_sum += float(val_loss.item())
 
+                    # Compute SSIM for this batch and accumulate.
+                    batch_ssim = _compute_batch_ssim(val_pred, val_high)
+                    val_ssim_sum += float(batch_ssim.item())
+
             val_avg_loss = val_loss_sum / max(1, len(val_loader))
+            val_avg_ssim = val_ssim_sum / max(1, len(val_loader))
             epoch_val_losses.append(val_avg_loss)
-            print(f"Epoch {epoch}/{config.epochs} - val   avg loss: {val_avg_loss:.6f}")
+            epoch_val_ssim.append(val_avg_ssim)
+            print(
+                f"Epoch {epoch}/{config.epochs} - val   avg loss: {val_avg_loss:.6f} | "
+                f"val SSIM: {val_avg_ssim:.4f}"
+            )
+
+            # Append SSIM history to a simple text log for later analysis.
+            ssim_log_path = os.path.join(logs_dir, "val_ssim.txt")
+            with open(ssim_log_path, "a", encoding="utf-8") as ssim_handle:
+                ssim_handle.write(f"{epoch} {val_avg_ssim:.6f}\n")
 
         # Save checkpoint at end of epoch.
         # - Default: save every epoch.
@@ -565,5 +703,10 @@ def train_unet(config: TrainConfig) -> None:
                 epoch_steps=epoch_steps,
                 epoch_train_losses=epoch_train_losses,
                 epoch_val_losses=epoch_val_losses,
+                logs_dir=logs_dir,
+                plot_step_loss=config.plot_step_loss,
+            )
+            _export_ssim_curve(
+                epoch_val_ssim=epoch_val_ssim,
                 logs_dir=logs_dir,
             )

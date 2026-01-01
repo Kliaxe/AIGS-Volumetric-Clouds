@@ -114,6 +114,9 @@ def _build_train_config(config: dict, project_root: Path) -> TrainConfig:
         "export_every_n_epochs": train_section.get(
             "export_every_n_epochs", field_defaults.get("export_every_n_epochs", 0)
         ),
+        "plot_step_loss": train_section.get(
+            "plot_step_loss", field_defaults.get("plot_step_loss", True)
+        ),
         "save_epoch_stride": train_section.get(
             "save_epoch_stride", field_defaults.get("save_epoch_stride", 1)
         ),
@@ -235,6 +238,8 @@ def _aggregate_experiment_loss_curves(experiments_root: Path) -> None:
         return steps, train_vals, val_vals
 
     # Collect per-experiment epoch curves.
+    # We keep only validation curves here to avoid clutter; per-experiment
+    # loss_curve.png still shows both train and val if needed.
     series: list[tuple[str, np.ndarray, np.ndarray]] = []
     for exp_dir in experiment_dirs:
         logs_dir = exp_dir / "logs"
@@ -263,18 +268,7 @@ def _aggregate_experiment_loss_curves(experiments_root: Path) -> None:
             # Let matplotlib choose a default colour when not specified.
             base_colour = None
 
-        # Train: solid line, base colour.
-        plt.plot(
-            epochs,
-            train_arr,
-            label=f"{exp_name} train",
-            color=base_colour,
-            linewidth=1.5,
-            marker="o",
-            markersize=3,
-        )
-
-        # Val: same hue but lighter, or default if base colour is None.
+        # Val: plot only validation curves in the aggregate view to reduce clutter.
         if np.any(np.isfinite(val_arr)):
             if base_colour is not None:
                 rgb = np.array(matplotlib.colors.to_rgb(base_colour))
@@ -286,10 +280,10 @@ def _aggregate_experiment_loss_curves(experiments_root: Path) -> None:
             plt.plot(
                 epochs,
                 val_arr,
-                label=f"{exp_name} val",
+                label=f"{exp_name}",
                 color=val_colour,
                 linewidth=1.5,
-                linestyle="--",
+                linestyle="-",
                 marker="s",
                 markersize=3,
             )
@@ -297,8 +291,8 @@ def _aggregate_experiment_loss_curves(experiments_root: Path) -> None:
     plt.yscale("log")
     plt.ylim(bottom=5e-3, top=1e-1)
     plt.xlabel("Epoch")
-    plt.ylabel("L1 Loss (log scale)")
-    plt.title("Experiment comparison – epoch average loss")
+    plt.ylabel("Validation L1 Loss (log scale)")
+    plt.title("Experiment comparison – validation loss only")
     plt.grid(True, which="both", linestyle="--", alpha=0.4)
     plt.legend(loc="best", fontsize=8)
     plt.tight_layout()
@@ -419,6 +413,7 @@ def main() -> None:
                 # Allow experiments to override common knobs (feature toggles, capacity, schedule).
                 override_keys = {
                     "epochs",
+                    "plot_step_loss",
                     "batch_size",
                     "learning_rate",
                     "crop_size",

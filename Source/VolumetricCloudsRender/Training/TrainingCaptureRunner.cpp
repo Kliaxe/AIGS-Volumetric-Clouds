@@ -143,6 +143,16 @@ void TrainingCaptureRunner::BeginSession()
     m_originalCameraControllerState = m_cameraController.IsEnabled();
     m_cameraController.SetEnabled(false);
 
+    // Cache original cloud state so we can restore it after the session.
+    m_originalSunDirection = m_cloudsPass.GetSunDirection();
+    m_originalSunIlluminance = m_cloudsPass.GetSunIlluminance();
+    m_originalExtinctionDensityMultiplier = m_cloudsPass.GetExtinctionCoefficientMultiplier();
+    m_originalTotalNoiseScale = m_cloudsPass.GetTotalNoiseScale();
+    m_originalCoverageAmount = m_cloudsPass.GetCoverageAmount();
+    m_originalCoverageMinimum = m_cloudsPass.GetCoverageMinimum();
+    m_originalTypeAmount = m_cloudsPass.GetTypeAmount();
+    m_originalTypeMinimum = m_cloudsPass.GetTypeMinimum();
+
     m_sampler.SetRandomSeed(m_config.GetRandomSeed());
 
     // Configure and start background frame writer
@@ -173,6 +183,16 @@ void TrainingCaptureRunner::EndSession()
         m_isActive = false;
         return;
     }
+
+    // Restore cloud state that may have been modified during capture.
+    m_cloudsPass.SetExtinctionCoefficientMultiplier(m_originalExtinctionDensityMultiplier);
+    m_cloudsPass.SetTotalNoiseScale(m_originalTotalNoiseScale);
+    m_cloudsPass.SetCoverageAmount(m_originalCoverageAmount);
+    m_cloudsPass.SetCoverageMinimum(m_originalCoverageMinimum);
+    m_cloudsPass.SetTypeAmount(m_originalTypeAmount);
+    m_cloudsPass.SetTypeMinimum(m_originalTypeMinimum);
+    m_cloudsPass.SetSunDirection(m_originalSunDirection);
+    m_cloudsPass.SetSunIlluminance(m_originalSunIlluminance);
 
     m_cloudsPass.SetMaxStepCount(m_config.GetFullResolutionMaxStepCount());
     m_cloudsPass.SetJitterEnabled(m_config.GetHighResolutionJitterEnabled());
@@ -221,17 +241,73 @@ void TrainingCaptureRunner::CaptureNextPair()
     const TrainingCameraSampler::CameraSample sample = m_sampler.GenerateSample();
     ApplyCameraSample(sample);
 
-    // Determine capture time: always override with configured range during capture
+    // Deterministic RNG per pair using training seed and pair index.
+    std::mt19937_64 rng(m_config.GetRandomSeed() ^
+                        (0x9E3779B97F4A7C15ULL +
+                         static_cast<std::uint64_t>(m_completedPairs) * 0xBF58476D1CE4E5B9ULL));
+
+    auto sampleFloat = [&rng](float a, float b) -> float
+    {
+        const float lo = std::min(a, b);
+        const float hi = std::max(a, b);
+        if (hi <= lo)
+        {
+            return lo;
+        }
+
+        std::uniform_real_distribution<float> dist(lo, hi);
+        return dist(rng);
+    };
+
+    auto sampleVec3 = [&sampleFloat](const glm::vec3& a, const glm::vec3& b) -> glm::vec3
+    {
+        return glm::vec3(
+            sampleFloat(a.x, b.x),
+            sampleFloat(a.y, b.y),
+            sampleFloat(a.z, b.z));
+    };
+
+    // Determine capture time: always override with configured range during capture.
     const float tMin = m_config.GetMinAnimationTime();
     const float tMax = m_config.GetMaxAnimationTime();
     float captureTimeSeconds = m_owner.GetCurrentTime();
-    {
-        // Deterministic RNG per pair using training seed and pair index
-        std::mt19937_64 rng(m_config.GetRandomSeed() ^ (0x9E3779B97F4A7C15ULL + static_cast<std::uint64_t>(m_completedPairs) * 0xBF58476D1CE4E5B9ULL));
-        std::uniform_real_distribution<float> dist(tMin, tMax);
-        captureTimeSeconds = dist(rng);
-        m_cloudsPass.SetTime(captureTimeSeconds);
-    }
+    captureTimeSeconds = sampleFloat(tMin, tMax);
+    m_cloudsPass.SetTime(captureTimeSeconds);
+
+    // Sample extinction density multiplier.
+    const float extinctionDensityMultiplier = sampleFloat(
+        m_config.GetMinExtinctionDensityMultiplier(),
+        m_config.GetMaxExtinctionDensityMultiplier());
+    m_cloudsPass.SetExtinctionCoefficientMultiplier(extinctionDensityMultiplier);
+
+    // Sample total noise scale.
+    const float totalNoiseScale = sampleFloat(m_config.GetMinTotalNoiseScale(),
+                                              m_config.GetMaxTotalNoiseScale());
+    m_cloudsPass.SetTotalNoiseScale(totalNoiseScale);
+
+    // Sample coverage and type shaping parameters.
+    const float coverageAmount = sampleFloat(m_config.GetMinCoverageAmount(),
+                                             m_config.GetMaxCoverageAmount());
+    const float coverageMinimum = sampleFloat(m_config.GetMinCoverageMinimum(),
+                                              m_config.GetMaxCoverageMinimum());
+    const float typeAmount = sampleFloat(m_config.GetMinTypeAmount(),
+                                         m_config.GetMaxTypeAmount());
+    const float typeMinimum = sampleFloat(m_config.GetMinTypeMinimum(),
+                                          m_config.GetMaxTypeMinimum());
+
+    m_cloudsPass.SetCoverageAmount(coverageAmount);
+    m_cloudsPass.SetCoverageMinimum(coverageMinimum);
+    m_cloudsPass.SetTypeAmount(typeAmount);
+    m_cloudsPass.SetTypeMinimum(typeMinimum);
+
+    // Sample sun direction and illuminance.
+    const glm::vec3 sunDirSample = sampleVec3(m_config.GetMinSunDirection(),
+                                              m_config.GetMaxSunDirection());
+    m_cloudsPass.SetSunDirection(sunDirSample);
+
+    const glm::vec3 sunIlluminanceSample = sampleVec3(m_config.GetMinSunIlluminance(),
+                                                      m_config.GetMaxSunIlluminance());
+    m_cloudsPass.SetSunIlluminance(sunIlluminanceSample);
 
     int windowWidth = 0;
     int windowHeight = 0;

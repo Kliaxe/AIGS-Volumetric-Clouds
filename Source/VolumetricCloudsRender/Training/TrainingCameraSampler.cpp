@@ -4,6 +4,9 @@
 #include <glm/gtc/constants.hpp>
 #include <glm/glm.hpp>
 
+// Single viewpoint dataset? If defined, the camera will be fixed at the origin.
+#define DATASET_SINGLE
+
 // --------------------------------------------------------------------------------------------------
 // ctor
 // --------------------------------------------------------------------------------------------------
@@ -11,14 +14,25 @@ TrainingCameraSampler::TrainingCameraSampler()
     : m_randomEngine(0xC0FFEEULL)
     , m_seed(0xC0FFEEULL)
     , m_focusPoint(0.0f, 0.0f, 0.0f) // Keep the focus point at the origin for now.
-    , m_minRadius(1.0f)//m_minRadius(6000.0f)
-    , m_maxRadius(1.0f)//m_maxRadius(12000.0f)
+#ifdef DATASET_SINGLE
+    , m_minRadius(1.0f)
+    , m_maxRadius(1.0f)
     , m_minAltitude(0.0f)
-    , m_maxAltitude(0.0f)//m_maxAltitude(2500.0f)
-    , m_minYaw(0.0f)//m_minYaw(-glm::pi<float>())
-    , m_maxYaw(0.0f)//m_maxYaw(glm::pi<float>())
-    , m_minPitch(0.0f)//m_minPitch(glm::radians(-10.0f))
-    , m_maxPitch(0.0f)//m_maxPitch(glm::radians(80.0f))
+    , m_maxAltitude(0.0f)
+    , m_minYaw(0.0f)
+    , m_maxYaw(0.0f)
+    , m_minPitch(0.0f)
+    , m_maxPitch(0.0f)
+#else
+    , m_minRadius(6000.0f)
+    , m_maxRadius(12000.0f)
+    , m_minAltitude(0.0f)
+    , m_maxAltitude(2500.0f)
+    , m_minYaw(-glm::pi<float>())
+    , m_maxYaw(glm::pi<float>())
+    , m_minPitch(glm::radians(-10.0f))
+    , m_maxPitch(glm::radians(80.0f))
+#endif
 {
 }
 

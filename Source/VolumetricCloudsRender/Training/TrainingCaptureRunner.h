@@ -3,6 +3,7 @@
 #include <memory>
 #include <cstdint>
 #include <glm/vec2.hpp>
+#include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 #include <glm/mat4x4.hpp>
 
@@ -72,6 +73,16 @@ private:
     glm::mat4 m_originalViewMatrix;
     glm::mat4 m_originalProjectionMatrix;
     bool m_originalCameraControllerState;
+
+    // Original cloud state restored when the capture session ends.
+    glm::vec3 m_originalSunDirection;
+    glm::vec3 m_originalSunIlluminance;
+    float     m_originalExtinctionDensityMultiplier;
+    float     m_originalTotalNoiseScale;
+    float     m_originalCoverageAmount;
+    float     m_originalCoverageMinimum;
+    float     m_originalTypeAmount;
+    float     m_originalTypeMinimum;
 };
 
 

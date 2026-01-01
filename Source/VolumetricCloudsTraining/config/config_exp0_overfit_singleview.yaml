@@ -1,0 +1,97 @@
+# ================================================================
+# Volumetric Clouds Training Configuration - Experiment 0 (Overfit, Single View)
+# ================================================================
+
+# Single-view dataset (pre-rendered).
+name: exp0_overfit_singleview  # Label for this configuration; used in output paths.
+
+common_model: &common_model
+  model_base_channels: 32  # Base number of channels in the UNet.
+  model_bilinear: true     # Use bilinear upsampling in the decoder.
+  model_learn_residual: true  # Predict residual w.r.t. input.
+
+common_split: &common_split
+  train_fraction: 0.8   # Fraction of samples for training split.
+  val_fraction: 0.15    # Fraction of samples for validation split.
+  test_fraction: 0.05   # Fraction of samples for test split.
+  split_seed: 12345     # Fixed seed for deterministic split.
+
+common_aux: &common_aux
+  use_view_transmittance: true   # Enable view transmittance buffer.
+  use_light_transmittance: true  # Enable light transmittance buffer.
+  use_linear_depth: true         # Enable linear depth buffer.
+  use_normals: true              # Enable normals buffer.
+  depth_normalization_max: 70000.0  # Depth normalization scale.
+
+train:
+  # Merge shared defaults; fields below can override them if needed.
+  <<: [*common_model, *common_split, *common_aux]
+
+  data_dir: TrainingCaptures_Single  # Single-view dataset root.
+  output_dir: Outputs                # Base output directory.
+
+  # Training schedule ---------------------------------------------------------
+  epochs: 200          # Allow enough epochs to strongly overfit tiny datasets.
+  batch_size: 64       # Batch size for training.
+  learning_rate: 0.00005  # Learning rate for optimizer.
+  crop_size: 256       # Training crop size.
+  limit_pairs: null    # Overridden per-experiment for tiny datasets.
+
+  # Loss configuration ---------------------------------------------------------
+  use_auxiliary_in_loss: false  # Plain RGB L1 loss; auxiliary buffers only affect inputs.
+
+  # Runtime behaviour ---------------------------------------------------------
+  num_workers: 4            # Number of data loader workers.
+  device: cuda              # Training device.
+  save_epoch_stride: 50     # Checkpoint stride for these long runs.
+  save_every_n_steps: 8192  # Step-based checkpoint stride.
+  log_every_n_steps: 256    # Logging stride.
+  save_only_last_epoch: false  # Keep intermediate checkpoints.
+  export_every_n_epochs: 50    # Export loss curves regularly.
+
+  # Experiment grid -----------------------------------------------------------
+  # Each experiment uses a different tiny dataset size to study overfitting.
+  experiments:
+    - name: overfit_pairs_1
+      limit_pairs: 1      # Use only a single training pair.
+
+    - name: overfit_pairs_2
+      limit_pairs: 2      # Use two training pairs.
+
+    - name: overfit_pairs_4
+      limit_pairs: 4      # Use four training pairs.
+
+infer:
+  # Model checkpoint to use for inference (can be updated as needed).
+  checkpoint: Outputs/checkpoints/unet_epoch_200.pt
+
+  # Model configuration ---------------------------------------------------------
+  <<: [*common_model, *common_split, *common_aux]
+
+  # Inference input settings ----------------------------------------------------
+  input: TrainingCaptures_Single  # Same dataset root as training.
+  input_glob: "*_low.pfm"         # Pattern for low-resolution inputs.
+  split_mode: test                    # Evaluate on test split.
+  split_sample_index: 0               # First test sample only (can be changed).
+  recursive: false                    # Non-recursive search.
+
+  # Output directory and naming -------------------------------------------------
+  output_dir: Outputs/infer
+  output_suffix: "_pred"
+
+  # Optional experiment-aware inference ---------------------------------------
+  experiment_name: overfit_pairs_1    # Default experiment label for inference.
+  checkpoint_dir: Outputs/exp0_overfit_singleview/experiments/overfit_pairs_1/checkpoints
+  checkpoint_glob: "unet_epoch_*.pt"
+  run_all_checkpoints: true
+  run_all_experiments: false
+
+  # Runtime behaviour -----------------------------------------------------------
+  device: cuda
+  upsample_mode: bicubic
+  align_corners: false
+  clamp_min: 0.0
+  clamp_max: 1.0
+  scale_factor: 4
+
+

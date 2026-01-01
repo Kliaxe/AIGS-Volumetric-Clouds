@@ -530,7 +530,7 @@ vec3 SampleAlbedo(float density, vec3 weatherData)
 
 vec3 SampleExtinction(float density)
 {
-	vec3 extinction = density * uExtinctionCoefficient;
+	vec3 extinction = density * uExtinctionCoefficient * uExtinctionCoefficientMultiplier;
 	return extinction;
 }
 

@@ -4,7 +4,8 @@
 // -------------------------------------------------------------------------
 
 uniform vec3  uAlbedo = vec3(0.9f, 0.9f, 0.9f); // Cloud albedo is normally very close to white
-uniform vec3  uExtinctionCoefficient = vec3(0.71f * 0.1f, 0.86f * 0.1f, 1.0f * 0.1f);
+uniform vec3  uExtinctionCoefficient = vec3(0.71f, 0.86f, 1.0f);
+uniform float uExtinctionCoefficientMultiplier = 0.025f;
 uniform vec3  uEarthGroundAlbedo = vec3(0.3f, 0.3f, 0.3f);
 
 uniform vec3  uSunDirection = vec3(0.0f, 1.0f, 0.0f);

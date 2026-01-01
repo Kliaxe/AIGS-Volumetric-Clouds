@@ -1,0 +1,118 @@
+# ================================================================
+# Volumetric Clouds Training Configuration - Experiment 1 (Buffers, General Views)
+# ================================================================
+
+# General-view dataset (camera can move freely).
+name: exp1_buffers_general  # Label for this configuration; used in output paths.
+
+common_model: &common_model
+  model_base_channels: 32      # Base number of channels in the UNet.
+  model_bilinear: true         # Use bilinear upsampling in the decoder.
+  model_learn_residual: true   # Predict residual w.r.t. input.
+
+common_split: &common_split
+  train_fraction: 0.8   # Fraction of samples for training split.
+  val_fraction: 0.15    # Fraction of samples for validation split.
+  test_fraction: 0.05   # Fraction of samples for test split.
+  split_seed: 12345     # Fixed seed for deterministic split.
+
+common_aux: &common_aux
+  use_view_transmittance: false
+  use_light_transmittance: false
+  use_linear_depth: false
+  use_normals: false
+  depth_normalization_max: 70000.0  # Depth normalization scale.
+
+train:
+  # Merge shared defaults; fields below can override them if needed.
+  <<: [*common_model, *common_split, *common_aux]
+
+  data_dir: TrainingCaptures_General  # General-view dataset root (to be rendered).
+  output_dir: Outputs                 # Base output directory.
+
+  # Training schedule ---------------------------------------------------------
+  epochs: 100          # Shared schedule across buffer configurations.
+  batch_size: 64       # Batch size for training.
+  learning_rate: 0.00005  # Learning rate for optimizer.
+  crop_size: 256       # Training crop size.
+  limit_pairs: null    # Use full dataset; keep constant across experiments.
+
+  # Loss configuration ---------------------------------------------------------
+  use_auxiliary_in_loss: false  # Plain RGB L1 loss; auxiliary buffers only affect inputs.
+
+  # Runtime behaviour ---------------------------------------------------------
+  num_workers: 4            # Number of data loader workers.
+  device: cuda              # Training device.
+  save_epoch_stride: 20     # Checkpoint stride.
+  save_every_n_steps: 8192  # Step-based checkpoint stride.
+  log_every_n_steps: 256    # Logging stride.
+  save_only_last_epoch: false  # Keep intermediate checkpoints.
+  export_every_n_epochs: 50    # Export loss curves regularly.
+
+  # Experiment grid -----------------------------------------------------------
+  # Each experiment toggles which auxiliary buffers are used as input.
+  experiments:
+    # - name: rgb_only
+    #   use_view_transmittance: false
+    #   use_light_transmittance: false
+    #   use_linear_depth: false
+    #   use_normals: false
+
+    # - name: rgb_plus_viewT
+    #   use_view_transmittance: true
+    #   use_light_transmittance: false
+    #   use_linear_depth: false
+    #   use_normals: false
+
+    # - name: rgb_plus_normals
+    #   use_view_transmittance: false
+    #   use_light_transmittance: false
+    #   use_linear_depth: false
+    #   use_normals: true
+
+    # - name: rgb_plus_viewT_normals
+    #   use_view_transmittance: true
+    #   use_light_transmittance: false
+    #   use_linear_depth: false
+    #   use_normals: true
+
+    - name: rgb_plus_depth
+      use_view_transmittance: false
+      use_light_transmittance: false
+      use_linear_depth: true
+      use_normals: false
+
+infer:
+  # Model checkpoint to use for inference (can be updated as needed).
+  checkpoint: Outputs/checkpoints/unet_epoch_100.pt
+
+  # Model configuration ---------------------------------------------------------
+  <<: [*common_model, *common_split, *common_aux]
+
+  # Inference input settings ----------------------------------------------------
+  input: TrainingCaptures_General  # Same dataset root as training.
+  input_glob: "*_low.pfm"          # Pattern for low-resolution inputs.
+  split_mode: test                 # Evaluate on test split.
+  split_sample_index: 0            # First test sample only (can be changed).
+  recursive: false                 # Non-recursive search.
+
+  # Output directory and naming -------------------------------------------------
+  output_dir: Outputs/infer
+  output_suffix: "_pred"
+
+  # Optional experiment-aware inference ---------------------------------------
+  experiment_name: rgb_only    # Default experiment label for inference.
+  checkpoint_dir: Outputs/exp1_buffers_general/experiments/rgb_only/checkpoints
+  checkpoint_glob: "unet_epoch_*.pt"
+  run_all_checkpoints: true
+  run_all_experiments: true
+
+  # Runtime behaviour -----------------------------------------------------------
+  device: cuda
+  upsample_mode: bicubic
+  align_corners: false
+  clamp_min: 0.0
+  clamp_max: 1.0
+  scale_factor: 4
+
+

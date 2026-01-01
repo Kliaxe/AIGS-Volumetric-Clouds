@@ -29,6 +29,25 @@ public:
     void SetAmbientLuminance(const glm::vec3& luminance);
     const glm::vec3& GetAmbientLuminance() const;
 
+    // Cloud optical properties used by the training capture path.
+    void SetExtinctionCoefficientMultiplier(float multiplier);
+    float GetExtinctionCoefficientMultiplier() const;
+
+    void SetTotalNoiseScale(float scale);
+    float GetTotalNoiseScale() const;
+
+    void SetCoverageAmount(float amount);
+    float GetCoverageAmount() const;
+
+    void SetCoverageMinimum(float minimum);
+    float GetCoverageMinimum() const;
+
+    void SetTypeAmount(float amount);
+    float GetTypeAmount() const;
+
+    void SetTypeMinimum(float minimum);
+    float GetTypeMinimum() const;
+
     // Controls whether per-ray white-noise jitter is applied in the
     // volumetric raymarch (see uJitterEnabled in the compute shader).
     void SetJitterEnabled(bool enabled);
@@ -93,6 +112,13 @@ private:
     ShaderProgram::Location m_maxStepCountLocation = -1;
     ShaderProgram::Location m_jitterEnabledLocation = -1;
 
+    ShaderProgram::Location m_extinctionCoefficientMultiplierLocation = -1;
+    ShaderProgram::Location m_totalNoiseScaleLocation = -1;
+    ShaderProgram::Location m_coverageAmountLocation = -1;
+    ShaderProgram::Location m_coverageMinimumLocation = -1;
+    ShaderProgram::Location m_typeAmountLocation = -1;
+    ShaderProgram::Location m_typeMinimumLocation = -1;
+
     // Composite shader uniform locations
     ShaderProgram::Location m_compositeCloudSamplerLocation = -1;
 
@@ -138,4 +164,12 @@ private:
     glm::vec3 m_sunDirection = glm::vec3(0.0f, 1.0f, 0.0f);
     glm::vec3 m_sunIlluminance = glm::vec3(8.0f, 8.0f, 7.0f);
     glm::vec3 m_ambientLuminance = glm::vec3(0.5f, 0.6f, 0.7f);
+
+    // Cloud optical properties (defaults mirror shader-side values).
+    float m_extinctionCoefficientMultiplier = 0.025f;
+    float m_totalNoiseScale = 0.0006f;
+    float m_coverageAmount = 1.0f;
+    float m_coverageMinimum = 0.0f;
+    float m_typeAmount = 1.0f;
+    float m_typeMinimum = 0.0f;
 };

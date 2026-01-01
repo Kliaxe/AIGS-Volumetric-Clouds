@@ -1,137 +1,80 @@
 # ================================================================
-# Volumetric Clouds Training Configuration
+# Volumetric Clouds Training Configuration - Default (Single View)
 # ================================================================
+#
+# This file exists as a convenient default for:
+#   python main.py --mode train
+#
+# Paper experiments live in:
+# - config_exp0_overfit_singleview.yaml / config_exp0_overfit_general.yaml
+# - config_exp1_buffers_singleview.yaml / config_exp1_buffers_general.yaml
+# - config_exp2_data_efficiency_singleview.yaml / config_exp2_data_efficiency_general.yaml
+#
 
-# Paths are resolved relative to the project root (next to this config/ folder).
-name: default  # Label for this configuration; used in output paths.
+# Single-view dataset (pre-rendered).
+name: default_singleview
 
-# Common blocks reused by both train / infer -----------------------------------
 common_model: &common_model
-  model_base_channels: 32
-  model_bilinear: true
-  model_learn_residual: true
+  model_base_channels: 32  # Base number of channels in the UNet.
+  model_bilinear: true     # Use bilinear upsampling in the decoder.
+  model_learn_residual: true  # Predict residual w.r.t. input.
 
 common_split: &common_split
-  train_fraction: 0.8
-  val_fraction: 0.15
-  test_fraction: 0.05
-  split_seed: 12345
+  train_fraction: 0.8   # Fraction of samples for training split.
+  val_fraction: 0.15    # Fraction of samples for validation split.
+  test_fraction: 0.05   # Fraction of samples for test split.
+  split_seed: 12345     # Fixed seed for deterministic split.
+
 common_aux: &common_aux
   use_view_transmittance: false
   use_light_transmittance: false
   use_linear_depth: false
   use_normals: false
-  depth_normalization_max: 70000.0
+  depth_normalization_max: 70000.0  # Depth normalization scale.
 
 train:
   # Merge shared defaults; fields below can override them if needed.
   <<: [*common_model, *common_split, *common_aux]
 
-  data_dir: TrainingCaptures
-  output_dir: Outputs
+  data_dir: TrainingCaptures_Single  # Single-view dataset root.
+  output_dir: Outputs                # Base output directory.
 
   # Training schedule ---------------------------------------------------------
-  epochs: 10
-  batch_size: 64
-  learning_rate: 0.0001
-  crop_size: 256
-  limit_pairs: null # null to use all available pairs
+  epochs: 100            # Default training length.
+  batch_size: 64         # Batch size for training.
+  learning_rate: 0.0001  # Learning rate for optimizer.
+  crop_size: 256         # Training crop size.
+  limit_pairs: null      # Use all pairs.
 
   # Loss configuration ---------------------------------------------------------
-  # Default is false, which uses a plain unweighted RGB loss.
-  use_auxiliary_in_loss: true
+  use_auxiliary_in_loss: false  # Plain RGB L1 loss; auxiliary buffers only affect inputs.
 
   # Runtime behaviour ---------------------------------------------------------
   num_workers: 8
   device: cuda
-  # Save a checkpoint every N epochs (always saves final epoch as well)
-  save_epoch_stride: 5
+  save_epoch_stride: 20
   save_every_n_steps: 8192
   log_every_n_steps: 256
   save_only_last_epoch: false
-  export_every_n_epochs: 5 # loss curves (PNG + TXT)
-
-  # Experiment grid -----------------------------------------------------------
-  # Each experiment overrides only the fields it needs. output_dir becomes: <train.output_dir>/<experiment.name>/
-  experiments:
-#    - name: baseline_rgb
-#      use_view_transmittance: false
-#      use_light_transmittance: false
-#      use_linear_depth: false
-#      use_normals: false
-
-#    - name: view_only
-#      use_view_transmittance: true
-#      use_light_transmittance: false
-#      use_linear_depth: false
-#      use_normals: false
-
-#    - name: light_only
-#      use_view_transmittance: false
-#      use_light_transmittance: true
-#      use_linear_depth: false
-#      use_normals: false
-
-#    - name: depth_only
-#      use_view_transmittance: false
-#      use_light_transmittance: false
-#      use_linear_depth: true
-#      use_normals: false
-
-    - name: normals_only
-      use_view_transmittance: false
-      use_light_transmittance: false
-      use_linear_depth: false
-      use_normals: true
-
-#    - name: all_features
-#      use_view_transmittance: true
-#      use_light_transmittance: true
-#      use_linear_depth: true
-#      use_normals: true
+  export_every_n_epochs: 50
 
 infer:
-  # Model checkpoint to use for inference
+  # Model checkpoint to use for inference (can be updated as needed).
   checkpoint: Outputs/checkpoints/unet_epoch_100.pt
 
   # Model configuration ---------------------------------------------------------
-  # Start from shared defaults; override here only if inference should differ.
   <<: [*common_model, *common_split, *common_aux]
 
-  # Input can be a single file or a directory. If a directory, input_glob applies.
-  # When split_mode="custom", input/input_glob behave as before and inference
-  # runs on whatever files match the pattern. When split_mode is one of
-  # {"train","val","test","all"}, input is treated as the dataset root and the
-  # same index split as training is reproduced.
-  input: TrainingCaptures
+  # Inference input settings ----------------------------------------------------
+  input: TrainingCaptures_Single
   input_glob: "*_low.pfm"
-  split_mode: test   # "custom" | "train" | "val" | "test" | "all"
-  # When using a split_mode other than "custom", you can optionally restrict
-  # inference to a single sample within the chosen split by providing an index
-  # here. For example: split_mode="test" and split_sample_index=0 will use only
-  # the first test sample. When null or omitted, all samples in the split are
-  # used.
+  split_mode: test
   split_sample_index: 0
   recursive: false
 
-  # Output directory (files will be named <input_basename>_pred.pfm)
+  # Output directory and naming -------------------------------------------------
   output_dir: Outputs/infer
   output_suffix: "_pred"
-
-  # Optional experiment-aware inference ---------------------------------------
-  # When run_all_checkpoints=true, checkpoints are discovered in checkpoint_dir
-  # using checkpoint_glob and each checkpoint is evaluated on the same input(s).
-  # Outputs are written under:
-  #   output_dir/<experiment_name>/<checkpoint_tag>/<input>_pred.pfm
-  experiment_name: baseline_rgb    # label used in the output folder hierarchy
-  checkpoint_dir: Outputs/baseline_vs_aux_features/experiments/baseline_rgb/checkpoints
-  checkpoint_glob: "unet_epoch_*.pt"
-  run_all_checkpoints: true       # set true to iterate all matching checkpoints
-  # When run_all_experiments is true, main.py will loop over all entries in
-  # train.experiments and, for each one, build an InferConfig that points at:
-  #   Outputs/<name>/experiments/<experiment_name>/checkpoints
-  # experiment_name / checkpoint_dir above are ignored in that mode.
-  run_all_experiments: true
 
   # Runtime behaviour -----------------------------------------------------------
   device: cuda
@@ -140,3 +83,5 @@ infer:
   clamp_min: 0.0
   clamp_max: 1.0
   scale_factor: 4
+
+
