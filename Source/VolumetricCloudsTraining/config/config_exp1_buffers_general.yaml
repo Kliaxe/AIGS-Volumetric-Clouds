@@ -52,34 +52,40 @@ train:
   # Experiment grid -----------------------------------------------------------
   # Each experiment toggles which auxiliary buffers are used as input.
   experiments:
-    # - name: rgb_only
-    #   use_view_transmittance: false
-    #   use_light_transmittance: false
-    #   use_linear_depth: false
-    #   use_normals: false
+    - name: rgb_only
+      use_view_transmittance: false
+      use_light_transmittance: false
+      use_linear_depth: false
+      use_normals: false
 
-    # - name: rgb_plus_viewT
-    #   use_view_transmittance: true
-    #   use_light_transmittance: false
-    #   use_linear_depth: false
-    #   use_normals: false
+    - name: rgb_plus_viewT
+      use_view_transmittance: true
+      use_light_transmittance: false
+      use_linear_depth: false
+      use_normals: false
 
-    # - name: rgb_plus_normals
-    #   use_view_transmittance: false
-    #   use_light_transmittance: false
-    #   use_linear_depth: false
-    #   use_normals: true
+    - name: rgb_plus_normals
+      use_view_transmittance: false
+      use_light_transmittance: false
+      use_linear_depth: false
+      use_normals: true
 
-    # - name: rgb_plus_viewT_normals
-    #   use_view_transmittance: true
-    #   use_light_transmittance: false
-    #   use_linear_depth: false
-    #   use_normals: true
+    - name: rgb_plus_viewT_normals
+      use_view_transmittance: true
+      use_light_transmittance: false
+      use_linear_depth: false
+      use_normals: true
 
     - name: rgb_plus_depth
       use_view_transmittance: false
       use_light_transmittance: false
       use_linear_depth: true
+      use_normals: false
+
+    - name: rgb_plus_lightT
+      use_view_transmittance: false
+      use_light_transmittance: true
+      use_linear_depth: false
       use_normals: false
 
 infer:

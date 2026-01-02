@@ -4,6 +4,7 @@
 # ================================================================
 
 import argparse
+import glob
 import shutil
 import sys
 from dataclasses import MISSING, fields
@@ -26,8 +27,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
 REPO_ROOT = PROJECT_ROOT.parent.parent
 
-# Output directory root (repo-level) --------------------------------------------
+# Output directory root (project-level) -----------------------------------------
+# NOTE: We intentionally keep outputs/ inside Source/VolumetricCloudsTraining so
+# training + inference always agree regardless of where the repo root lives.
 OUTPUTS_DIR_NAME = "outputs"
+OUTPUTS_ROOT = PROJECT_ROOT / OUTPUTS_DIR_NAME
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -99,8 +103,8 @@ def _build_train_config(config: dict, project_root: Path) -> TrainConfig:
     # Data lives under the training project root --------------------------------
     resolved_data_dir = _resolve_project_path(data_dir, project_root)
 
-    # outputs/ lives under the repo root -----------------------------------------
-    resolved_output_dir = _resolve_project_path(output_dir, REPO_ROOT)
+    # outputs/ lives under the project root --------------------------------------
+    resolved_output_dir = _resolve_project_path(output_dir, project_root)
 
     kwargs = {
         "data_dir": resolved_data_dir,
@@ -180,7 +184,7 @@ def _snapshot_config(config_path: Path, project_root: Path, run_name: str) -> No
     if not config_path.exists():
         return
 
-    target_dir = REPO_ROOT / OUTPUTS_DIR_NAME / run_name
+    target_dir = OUTPUTS_ROOT / run_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
     target_path = target_dir / config_path.name
@@ -318,16 +322,16 @@ def _build_infer_config(config: dict, project_root: Path) -> InferConfig:
 
     # Resolve paths --------------------------------------------------------------
     # - Input data stays relative to the training project root (captures live here).
-    # - Checkpoints and outputs are repo-root relative (outputs/ is at repo root).
+    # - Checkpoints and outputs are project-root relative (outputs/ is in this project).
     checkpoint_path = _resolve_project_path(
-        infer_section.get("checkpoint", "outputs/checkpoints/unet_epoch_1.pt"), REPO_ROOT
+        infer_section.get("checkpoint", "outputs/checkpoints/unet_epoch_1.pt"), project_root
     )
     input_path = _resolve_project_path(infer_section.get("input", "TrainingCaptures"), project_root)
 
     # When the user does not specify an explicit infer.output_dir, group results
     # under outputs/<run_name>/infer so that multiple configs can coexist cleanly.
     default_infer_output = f"outputs/{run_name}/infer"
-    output_dir = _resolve_project_path(infer_section.get("output_dir", default_infer_output), REPO_ROOT)
+    output_dir = _resolve_project_path(infer_section.get("output_dir", default_infer_output), project_root)
 
     return InferConfig(
         checkpoint=checkpoint_path,
@@ -359,7 +363,7 @@ def _build_infer_config(config: dict, project_root: Path) -> InferConfig:
         # Experiment-aware checkpoint selection --------------------------------
         experiment_name=str(infer_section.get("experiment_name", "")),
         checkpoint_dir=(
-            _resolve_project_path(infer_section["checkpoint_dir"], REPO_ROOT)
+            _resolve_project_path(infer_section["checkpoint_dir"], project_root)
             if "checkpoint_dir" in infer_section and infer_section["checkpoint_dir"]
             else ""
         ),
@@ -401,7 +405,7 @@ def main() -> None:
             base_train_config = _build_train_config(config_map, PROJECT_ROOT)
             # Group all experiments for this configuration under:
             #   outputs/<run_name>/experiments/<experiment_name>/
-            base_output_dir = (REPO_ROOT / OUTPUTS_DIR_NAME / run_name / "experiments")
+            base_output_dir = (OUTPUTS_ROOT / run_name / "experiments")
 
             for exp in experiments_cfg:
                 if not isinstance(exp, dict):
@@ -488,7 +492,7 @@ def main() -> None:
 
             base_infer_config = _build_infer_config(config_map, PROJECT_ROOT)
 
-            experiments_root = REPO_ROOT / OUTPUTS_DIR_NAME / run_name / "experiments"
+            experiments_root = OUTPUTS_ROOT / run_name / "experiments"
             # Group all inference outputs for this configuration under a shared
             # experiments/infer folder, and encode experiment / checkpoint in
             # the filename rather than nested directories.
@@ -532,6 +536,17 @@ def main() -> None:
                         exp_kwargs[key] = exp[key]
 
                 exp_infer_config = InferConfig(**exp_kwargs)
+
+                # Skip experiments that do not have checkpoints yet.
+                ckpt_glob = exp_infer_config.checkpoint_glob or "*.pt"
+                ckpt_pattern = str(exp_ckpt_dir / ckpt_glob)
+                if len(glob.glob(ckpt_pattern)) == 0:
+                    print("---------------------------------------------------------------")
+                    print(f"Skipping inference for experiment '{exp_name}'")
+                    print(f"  checkpoint_dir = {exp_infer_config.checkpoint_dir}")
+                    print(f"  reason         = no checkpoints matching {ckpt_glob!r}")
+                    print("---------------------------------------------------------------")
+                    continue
 
                 print("===============================================================")
                 print(f"Running inference for experiment '{exp_name}'")
